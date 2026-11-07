@@ -4,7 +4,7 @@
 
 int main(int argc, char *argv[])
 {
-    Qapplication app(argc, argv);
+    QApplication app(argc, argv);
 
     QMainWindow window;
     window.setWindowTitle("himashinya");

@@ -29,6 +29,23 @@ main_window::main_window(QWidget *parent) : QMainWindow(parent)
 	refresh_servers();
 }
 
+main_window::~main_window()
+{
+	for (auto *connection : connections) {
+		if (!connection->thread || !connection->worker)
+			continue;
+
+		if (!connection->thread->isRunning())
+			continue;
+
+		QMetaObject::invokeMethod(connection->worker, "disconnect",
+					  Qt::BlockingQueuedConnection);
+
+		connection->thread->quit();
+		connection->thread->wait();
+	}
+}
+
 void main_window::setup_ui()
 {
 	setWindowTitle("Himashinya");
@@ -83,14 +100,7 @@ void main_window::setup_ui()
 	terminal_tabs->addTab(welcome_page, "Welcome");
 
 	connect(terminal_tabs, &QTabWidget::tabCloseRequested, this,
-		[this](int index) {
-			if (terminal_tabs->count() <= 1)
-				return;
-
-			auto *page = terminal_tabs->widget(index);
-			terminal_tabs->removeTab(index);
-			page->deleteLater();
-		});
+		&main_window::close_terminal_tab);
 
 	/* Add server dialog */
 	connect(add_server, &QPushButton::clicked, this,
@@ -335,6 +345,13 @@ void main_window::connect_server()
 	auto *worker =
 	    new ssh_worker(server.host, server.port, server.username);
 
+	auto *connection = new ssh_connection;
+
+	connection->thread = thread;
+	connection->worker = worker;
+
+	connections.append(connection);
+
 	worker->moveToThread(thread);
 
 	connect(thread, &QThread::started, worker,
@@ -354,6 +371,9 @@ void main_window::connect_server()
 				QMetaObject::invokeMethod(worker,
 							  "trust_host_key",
 							  Qt::QueuedConnection);
+			} else {
+				QMetaObject::invokeMethod(worker, "disconnect",
+							  Qt::QueuedConnection);
 			}
 		});
 
@@ -364,41 +384,90 @@ void main_window::connect_server()
 		    this, "SSH Authentication",
 		    "Password:", QLineEdit::Password, {}, &ok);
 
-		if (!ok)
+		if (!ok) {
+			QMetaObject::invokeMethod(worker, "disconnect",
+						  Qt::QueuedConnection);
 			return;
+		}
 
 		QMetaObject::invokeMethod(worker, "authenticate",
 					  Qt::QueuedConnection,
 					  Q_ARG(QString, password));
 	});
 
-	connect(worker, &ssh_worker::authenticated, this, [this, server]() {
-		auto *page = new QWidget;
-		auto *layout = new QVBoxLayout(page);
+	connect(worker, &ssh_worker::authenticated, this,
+		[this, server, connection]() {
+			auto *page = new QWidget;
+			auto *layout = new QVBoxLayout(page);
 
-		auto *label = new QLabel(QString("Connected to %1\n%2@%3:%4")
-					     .arg(server.name)
-					     .arg(server.username)
-					     .arg(server.host)
-					     .arg(server.port));
+			auto *label =
+			    new QLabel(QString("Connected to %1\n%2@%3:%4")
+					   .arg(server.name)
+					   .arg(server.username)
+					   .arg(server.host)
+					   .arg(server.port));
 
-		label->setAlignment(Qt::AlignCenter);
-		layout->addWidget(label);
+			label->setAlignment(Qt::AlignCenter);
+			layout->addWidget(label);
 
-		int tab_index = terminal_tabs->addTab(page, server.name);
+			connection->page = page;
 
-		terminal_tabs->setCurrentIndex(tab_index);
-	});
+			int tab_index =
+			    terminal_tabs->addTab(page, server.name);
+
+			terminal_tabs->setCurrentIndex(tab_index);
+		});
 
 	connect(worker, &ssh_worker::failed, this,
-		[this](const QString &message) {
+		[this, worker](const QString &message) {
+			QMetaObject::invokeMethod(worker, "disconnect",
+						  Qt::QueuedConnection);
 			QMessageBox::warning(this, "SSH Connection Failed",
 					     message);
 		});
 
 	connect(thread, &QThread::finished, worker, &QObject::deleteLater);
-
 	connect(thread, &QThread::finished, thread, &QObject::deleteLater);
 
+	connect(worker, &ssh_worker::disconnected, thread, &QThread::quit,
+		Qt::DirectConnection);
+
+	connect(thread, &QThread::finished, this, [this, connection]() {
+		connections.removeAll(connection);
+		delete connection;
+	});
+
 	thread->start();
+}
+
+void main_window::close_terminal_tab(int index)
+{
+	if (terminal_tabs->count() <= 1)
+		return;
+
+	QWidget *page = terminal_tabs->widget(index);
+
+	for (auto *connection : connections) {
+		if (connection->page == page) {
+			close_ssh_connection(connection);
+			break;
+		}
+	}
+
+	terminal_tabs->removeTab(index);
+	page->deleteLater();
+}
+
+void main_window::close_ssh_connection(ssh_connection *connection)
+{
+	if (!connection || connection->closing)
+		return;
+
+	connection->closing = true;
+
+	if (!connection->worker || !connection->thread)
+		return;
+
+	QMetaObject::invokeMethod(connection->worker, "disconnect",
+				  Qt::QueuedConnection);
 }

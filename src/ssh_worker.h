@@ -19,6 +19,7 @@ public slots:
 	void trust_host_key();
 	void authenticate(const QString &password);
 	void disconnect();
+	void shutdown();
 
 signals:
 	void host_key_unknown(const QString &fingerprint);

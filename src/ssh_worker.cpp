@@ -52,3 +52,9 @@ void ssh_worker::disconnect()
 	client.disconnect();
 	emit disconnected();
 }
+
+void ssh_worker::shutdown()
+{
+	client.disconnect();
+	emit disconnected();
+}

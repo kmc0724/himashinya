@@ -1,4 +1,7 @@
+
 #include "ssh_worker.h"
+
+#include <QTimer>
 
 ssh_worker::ssh_worker(const QString &host, int port, const QString &username)
     : host(host), port(port), username(username)
@@ -7,6 +10,9 @@ ssh_worker::ssh_worker(const QString &host, int port, const QString &username)
 
 void ssh_worker::connect_to_server()
 {
+	if (stopping)
+		return;
+
 	if (!client.connect_to_server(host, port, username)) {
 		emit failed(client.last_error());
 		return;
@@ -29,6 +35,9 @@ void ssh_worker::connect_to_server()
 
 void ssh_worker::trust_host_key()
 {
+	if (stopping)
+		return;
+
 	if (!client.trust_host_key()) {
 		emit failed(client.last_error());
 		return;
@@ -39,22 +48,90 @@ void ssh_worker::trust_host_key()
 
 void ssh_worker::authenticate(const QString &password)
 {
+	if (stopping)
+		return;
+
 	if (!client.authenticate_password(password)) {
 		emit failed(client.last_error());
 		return;
 	}
 
 	emit authenticated();
+
+	if (!client.open_shell()) {
+		emit failed(client.last_error());
+		return;
+	}
+
+	shell_timer = new QTimer(this);
+	shell_timer->setInterval(20);
+
+	connect(shell_timer, &QTimer::timeout, this, &ssh_worker::poll_shell);
+
+	shell_timer->start();
+
+	emit shell_ready();
+}
+
+void ssh_worker::write_shell(const QByteArray &data)
+{
+	if (stopping || !client.is_shell_open())
+		return;
+
+	if (!client.write_shell(data))
+		emit failed(client.last_error());
+}
+
+void ssh_worker::resize_shell(int columns, int rows)
+{
+	if (stopping || !client.is_shell_open())
+		return;
+
+	if (!client.resize_shell(columns, rows))
+		emit failed(client.last_error());
+}
+
+void ssh_worker::poll_shell()
+{
+	if (stopping)
+		return;
+
+	if (!client.is_shell_open()) {
+		disconnect();
+		return;
+	}
+
+	QByteArray data;
+
+	for (int i = 0; i < 16; i++) {
+		int received = client.read_shell(data);
+
+		if (received < 0) {
+			emit failed(client.last_error());
+			disconnect();
+			return;
+		}
+
+		if (received == 0)
+			break;
+
+		emit shell_output(data);
+	}
 }
 
 void ssh_worker::disconnect()
 {
-	client.disconnect();
-	emit disconnected();
-}
+	if (stopping)
+		return;
 
-void ssh_worker::shutdown()
-{
+	stopping = true;
+
+	if (shell_timer) {
+		shell_timer->stop();
+		shell_timer->deleteLater();
+		shell_timer = nullptr;
+	}
+
 	client.disconnect();
 	emit disconnected();
 }

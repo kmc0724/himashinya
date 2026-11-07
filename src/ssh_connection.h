@@ -3,6 +3,7 @@
 
 #include "server_profile.h"
 
+#include <QByteArray>
 #include <QObject>
 #include <QThread>
 
@@ -23,6 +24,9 @@ public:
 	void trust_host_key();
 	void authenticate(const QString &password);
 
+	void write_shell(const QByteArray &data);
+	void resize_shell(int columns, int rows);
+
 signals:
 	void host_key_unknown(const QString &fingerprint);
 	void host_key_verified();
@@ -34,6 +38,12 @@ signals:
 	void trust_requested();
 	void authentication_requested(const QString &password);
 	void disconnect_requested();
+
+	void shell_ready();
+	void shell_output(const QByteArray &data);
+
+	void shell_write_requested(const QByteArray &data);
+	void shell_resize_requested(int columns, int rows);
 
 private:
 	QThread thread;

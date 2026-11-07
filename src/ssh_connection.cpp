@@ -40,6 +40,18 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 	connect(&thread, &QThread::finished, worker, &QObject::deleteLater);
 
 	connect(&thread, &QThread::finished, this, &ssh_connection::finished);
+
+	connect(this, &ssh_connection::shell_write_requested, worker,
+		&ssh_worker::write_shell, Qt::QueuedConnection);
+
+	connect(this, &ssh_connection::shell_resize_requested, worker,
+		&ssh_worker::resize_shell, Qt::QueuedConnection);
+
+	connect(worker, &ssh_worker::shell_ready, this,
+		&ssh_connection::shell_ready);
+
+	connect(worker, &ssh_worker::shell_output, this,
+		&ssh_connection::shell_output);
 }
 
 ssh_connection::~ssh_connection()
@@ -85,4 +97,16 @@ void ssh_connection::authenticate(const QString &password)
 {
 	if (!closing)
 		emit authentication_requested(password);
+}
+
+void ssh_connection::write_shell(const QByteArray &data)
+{
+	if (!closing)
+		emit shell_write_requested(data);
+}
+
+void ssh_connection::resize_shell(int columns, int rows)
+{
+	if (!closing)
+		emit shell_resize_requested(columns, rows);
 }

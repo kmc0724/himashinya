@@ -275,10 +275,13 @@ int ssh_client::read_shell(QByteArray &data)
 {
 	data.clear();
 
-	if (!is_shell_open()) {
-		error_message = "SSH shell is not open.";
+	if (!shell_channel) {
+		error_message = "SSH channel is not initialized.";
 		return -1;
 	}
+
+	if (is_shell_finished())
+		return 0;
 
 	char buffer[4096];
 
@@ -286,6 +289,9 @@ int ssh_client::read_shell(QByteArray &data)
 						    sizeof(buffer), 0);
 
 	if (received == SSH_ERROR) {
+		if (is_shell_finished())
+			return 0;
+
 		error_message = QString::fromUtf8(ssh_get_error(session));
 		return -1;
 	}
@@ -333,4 +339,13 @@ bool ssh_client::is_shell_open() const
 {
 	return shell_channel && ssh_channel_is_open(shell_channel) &&
 	       !ssh_channel_is_closed(shell_channel);
+}
+
+bool ssh_client::is_shell_finished() const
+{
+	if (!shell_channel)
+		return true;
+
+	return ssh_channel_is_eof(shell_channel) ||
+	       ssh_channel_is_closed(shell_channel);
 }

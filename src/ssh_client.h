@@ -39,6 +39,8 @@ public:
 
 	QString last_error() const;
 
+	bool is_shell_finished() const;
+
 private:
 	ssh_session session = nullptr;
 	ssh_channel shell_channel = nullptr;

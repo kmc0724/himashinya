@@ -27,6 +27,8 @@ public:
 	void write_shell(const QByteArray &data);
 	void resize_shell(int columns, int rows);
 
+	bool is_finished() const;
+
 signals:
 	void host_key_unknown(const QString &fingerprint);
 	void host_key_verified();
@@ -51,4 +53,5 @@ private:
 
 	bool started = false;
 	bool closing = false;
+	bool finished_state = false;
 };

@@ -39,7 +39,10 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 
 	connect(&thread, &QThread::finished, worker, &QObject::deleteLater);
 
-	connect(&thread, &QThread::finished, this, &ssh_connection::finished);
+	connect(&thread, &QThread::finished, this, [this]() {
+		finished_state = true;
+		emit finished();
+	});
 
 	connect(this, &ssh_connection::shell_write_requested, worker,
 		&ssh_worker::write_shell, Qt::QueuedConnection);
@@ -109,4 +112,9 @@ void ssh_connection::resize_shell(int columns, int rows)
 {
 	if (!closing)
 		emit shell_resize_requested(columns, rows);
+}
+
+bool ssh_connection::is_finished() const
+{
+	return finished_state;
 }

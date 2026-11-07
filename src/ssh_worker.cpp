@@ -75,20 +75,28 @@ void ssh_worker::authenticate(const QString &password)
 
 void ssh_worker::write_shell(const QByteArray &data)
 {
-	if (stopping || !client.is_shell_open())
+	if (stopping || client.is_shell_finished())
 		return;
 
-	if (!client.write_shell(data))
-		emit failed(client.last_error());
+	if (!client.write_shell(data)) {
+		if (!client.is_shell_finished())
+			emit failed(client.last_error());
+
+		disconnect();
+	}
 }
 
 void ssh_worker::resize_shell(int columns, int rows)
 {
-	if (stopping || !client.is_shell_open())
+	if (stopping || client.is_shell_finished())
 		return;
 
-	if (!client.resize_shell(columns, rows))
-		emit failed(client.last_error());
+	if (!client.resize_shell(columns, rows)) {
+		if (!client.is_shell_finished())
+			emit failed(client.last_error());
+
+		disconnect();
+	}
 }
 
 void ssh_worker::poll_shell()
@@ -96,14 +104,14 @@ void ssh_worker::poll_shell()
 	if (stopping)
 		return;
 
-	if (!client.is_shell_open()) {
+	if (client.is_shell_finished()) {
 		disconnect();
 		return;
 	}
 
 	QByteArray data;
 
-	for (int i = 0; i < 16; i++) {
+	for (int i = 0; i < 16; ++i) {
 		int received = client.read_shell(data);
 
 		if (received < 0) {
@@ -112,10 +120,16 @@ void ssh_worker::poll_shell()
 			return;
 		}
 
+		if (received > 0)
+			emit shell_output(data);
+
+		if (client.is_shell_finished()) {
+			disconnect();
+			return;
+		}
+
 		if (received == 0)
 			break;
-
-		emit shell_output(data);
 	}
 }
 

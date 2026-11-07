@@ -328,9 +328,6 @@ void main_window::connect_server()
 	const auto server = servers[index];
 	auto *connection = new ssh_connection(server, this);
 
-	connect(connection, &ssh_connection::finished, connection,
-		&QObject::deleteLater);
-
 	connect(connection, &ssh_connection::host_key_unknown, this,
 		[this, connection, server](const QString &fingerprint) {
 			auto answer = QMessageBox::question(
@@ -392,10 +389,12 @@ void main_window::connect_server()
 
 	connect(connection, &ssh_connection::failed, this,
 		[this, connection](const QString &message) {
-			connection->close();
+			if (!message.isEmpty()) {
+				QMessageBox::warning(
+				    this, "SSH Connection Failed", message);
+			}
 
-			QMessageBox::warning(this, "SSH Connection Failed",
-					     message);
+			connection->close();
 		});
 
 	connection->start();
@@ -412,9 +411,18 @@ void main_window::close_terminal_tab(int index)
 	    page->property("ssh_connection").value<QObject *>());
 
 	terminal_tabs->removeTab(index);
-
-	if (connection)
-		connection->close();
-
 	page->deleteLater();
+
+	if (!connection)
+		return;
+
+	if (connection->is_finished()) {
+		connection->deleteLater();
+		return;
+	}
+
+	connect(connection, &ssh_connection::finished, connection,
+		&QObject::deleteLater, Qt::UniqueConnection);
+
+	connection->close();
 }

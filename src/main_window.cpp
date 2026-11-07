@@ -1,9 +1,11 @@
 #include "main_window.h"
+#include "ssh_worker.h"
 
 #include <QAction>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -13,6 +15,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTabWidget>
+#include <QThread>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -94,7 +97,7 @@ void main_window::setup_ui()
 		&main_window::add_server);
 
 	connect(server_list, &QListWidget::itemDoubleClicked, this,
-		[this](QListWidgetItem *) { edit_server(); });
+		[this](QListWidgetItem *) { connect_server(); });
 
 	connect(server_list, &QWidget::customContextMenuRequested, this,
 		[this](const QPoint &pos) {
@@ -106,13 +109,19 @@ void main_window::setup_ui()
 			server_list->setCurrentItem(item);
 
 			QMenu menu(this);
+
+			auto *connect_action = menu.addAction("Connect");
+			menu.addSeparator();
+
 			auto *edit = menu.addAction("Edit");
 			auto *remove = menu.addAction("Delete");
 
 			auto *selected = menu.exec(
 			    server_list->viewport()->mapToGlobal(pos));
 
-			if (selected == edit)
+			if (selected == connect_action)
+				connect_server();
+			else if (selected == edit)
 				edit_server();
 			else if (selected == remove)
 				delete_server();
@@ -311,4 +320,85 @@ void main_window::delete_server()
 	servers.removeAt(index);
 	repository.save(servers);
 	refresh_servers();
+}
+
+void main_window::connect_server()
+{
+	int index = server_list->currentRow();
+
+	if (index < 0 || index >= servers.size())
+		return;
+
+	const auto server = servers[index];
+
+	auto *thread = new QThread(this);
+	auto *worker =
+	    new ssh_worker(server.host, server.port, server.username);
+
+	worker->moveToThread(thread);
+
+	connect(thread, &QThread::started, worker,
+		&ssh_worker::connect_to_server);
+
+	connect(worker, &ssh_worker::host_key_unknown, this,
+		[this, worker, server](const QString &fingerprint) {
+			auto answer = QMessageBox::question(
+			    this, "Unknown SSH Host Key",
+			    QString("Server: %1\n\n"
+				    "Fingerprint:\n%2\n\n"
+				    "Trust this server?")
+				.arg(server.name, fingerprint),
+			    QMessageBox::Yes | QMessageBox::No);
+
+			if (answer == QMessageBox::Yes) {
+				QMetaObject::invokeMethod(worker,
+							  "trust_host_key",
+							  Qt::QueuedConnection);
+			}
+		});
+
+	connect(worker, &ssh_worker::host_key_verified, this, [this, worker]() {
+		bool ok = false;
+
+		QString password = QInputDialog::getText(
+		    this, "SSH Authentication",
+		    "Password:", QLineEdit::Password, {}, &ok);
+
+		if (!ok)
+			return;
+
+		QMetaObject::invokeMethod(worker, "authenticate",
+					  Qt::QueuedConnection,
+					  Q_ARG(QString, password));
+	});
+
+	connect(worker, &ssh_worker::authenticated, this, [this, server]() {
+		auto *page = new QWidget;
+		auto *layout = new QVBoxLayout(page);
+
+		auto *label = new QLabel(QString("Connected to %1\n%2@%3:%4")
+					     .arg(server.name)
+					     .arg(server.username)
+					     .arg(server.host)
+					     .arg(server.port));
+
+		label->setAlignment(Qt::AlignCenter);
+		layout->addWidget(label);
+
+		int tab_index = terminal_tabs->addTab(page, server.name);
+
+		terminal_tabs->setCurrentIndex(tab_index);
+	});
+
+	connect(worker, &ssh_worker::failed, this,
+		[this](const QString &message) {
+			QMessageBox::warning(this, "SSH Connection Failed",
+					     message);
+		});
+
+	connect(thread, &QThread::finished, worker, &QObject::deleteLater);
+
+	connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+
+	thread->start();
 }

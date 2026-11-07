@@ -14,6 +14,8 @@ class main_window : public QMainWindow
 public:
 	explicit main_window(QWidget *parent = nullptr);
 
+	void connect_server();
+
 private:
 	void setup_ui();
 	void setup_style();

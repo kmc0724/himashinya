@@ -17,18 +17,11 @@ class main_window : public QMainWindow
 {
 public:
 	explicit main_window(QWidget *parent = nullptr);
-	~main_window() override;
+	~main_window() override = default;
 
 	void connect_server();
 
 private:
-	struct ssh_connection {
-		QPointer<QThread> thread;
-		QPointer<ssh_worker> worker;
-		QPointer<QWidget> page;
-		bool closing = false;
-	};
-
 	void setup_ui();
 	void setup_style();
 
@@ -38,7 +31,6 @@ private:
 	void delete_server();
 
 	void close_terminal_tab(int index);
-	void close_ssh_connection(ssh_connection *connection);
 
 	QTabWidget *sidebar_tabs = nullptr;
 	QTabWidget *terminal_tabs = nullptr;
@@ -46,5 +38,4 @@ private:
 
 	server_repository repository;
 	QList<server_profile> servers;
-	QList<ssh_connection *> connections;
 };

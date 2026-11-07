@@ -174,6 +174,8 @@ void ssh_client::disconnect()
 {
 	authenticated = false;
 
+	close_shell();
+
 	if (!session)
 		return;
 
@@ -197,4 +199,138 @@ bool ssh_client::is_authenticated() const
 QString ssh_client::last_error() const
 {
 	return error_message;
+}
+
+bool ssh_client::open_shell(int columns, int rows)
+{
+	if (!is_authenticated()) {
+		error_message = "SSH session is not authenticated.";
+		return false;
+	}
+
+	if (columns <= 0 || rows <= 0) {
+		error_message = "Invalid terminal dimensions.";
+		return false;
+	}
+
+	close_shell();
+
+	shell_channel = ssh_channel_new(session);
+
+	if (!shell_channel) {
+		error_message = "Failed to create SSH channel.";
+		return false;
+	}
+
+	if (ssh_channel_open_session(shell_channel) != SSH_OK) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		close_shell();
+		return false;
+	}
+
+	if (ssh_channel_request_pty_size(shell_channel, "xterm-256color",
+					 columns, rows) != SSH_OK) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		close_shell();
+		return false;
+	}
+
+	if (ssh_channel_request_shell(shell_channel) != SSH_OK) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		close_shell();
+		return false;
+	}
+
+	error_message.clear();
+	return true;
+}
+
+bool ssh_client::write_shell(const QByteArray &data)
+{
+	if (!is_shell_open()) {
+		error_message = "SSH shell is not open.";
+		return false;
+	}
+
+	qsizetype offset = 0;
+
+	while (offset < data.size()) {
+		int written = ssh_channel_write(
+		    shell_channel, data.constData() + offset,
+		    static_cast<uint32_t>(data.size() - offset));
+
+		if (written <= 0) {
+			error_message =
+			    QString::fromUtf8(ssh_get_error(session));
+			return false;
+		}
+
+		offset += written;
+	}
+
+	return true;
+}
+
+int ssh_client::read_shell(QByteArray &data)
+{
+	data.clear();
+
+	if (!is_shell_open()) {
+		error_message = "SSH shell is not open.";
+		return -1;
+	}
+
+	char buffer[4096];
+
+	int received = ssh_channel_read_nonblocking(shell_channel, buffer,
+						    sizeof(buffer), 0);
+
+	if (received == SSH_ERROR) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return -1;
+	}
+
+	if (received > 0)
+		data.append(buffer, received);
+
+	return received;
+}
+
+bool ssh_client::resize_shell(int columns, int rows)
+{
+	if (!is_shell_open()) {
+		error_message = "SSH shell is not open.";
+		return false;
+	}
+
+	if (columns <= 0 || rows <= 0) {
+		error_message = "Invalid terminal dimensions.";
+		return false;
+	}
+
+	if (ssh_channel_change_pty_size(shell_channel, columns, rows) !=
+	    SSH_OK) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	return true;
+}
+
+void ssh_client::close_shell()
+{
+	if (!shell_channel)
+		return;
+
+	if (ssh_channel_is_open(shell_channel))
+		ssh_channel_close(shell_channel);
+
+	ssh_channel_free(shell_channel);
+	shell_channel = nullptr;
+}
+
+bool ssh_client::is_shell_open() const
+{
+	return shell_channel && ssh_channel_is_open(shell_channel) &&
+	       !ssh_channel_is_closed(shell_channel);
 }

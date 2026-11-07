@@ -2,6 +2,7 @@
 
 #include <libssh/libssh.h>
 
+#include <QByteArray>
 #include <QString>
 
 class ssh_client
@@ -24,17 +25,24 @@ public:
 
 	bool authenticate_password(const QString &password);
 
-	void disconnect();
+	bool open_shell(int columns = 80, int rows = 24);
+	bool write_shell(const QByteArray &data);
+	int read_shell(QByteArray &data);
+	bool resize_shell(int columns, int rows);
+	void close_shell();
 
+	bool is_shell_open() const;
 	bool is_connected() const;
 	bool is_authenticated() const;
-	QString last_error() const;
 
-	bool is_host_key_trusted();
-	bool save_host_key();
+	void disconnect();
+
+	QString last_error() const;
 
 private:
 	ssh_session session = nullptr;
+	ssh_channel shell_channel = nullptr;
+
 	bool authenticated = false;
 	QString error_message;
 };

@@ -19,8 +19,10 @@ qt_add_executable(himashinya
     src/server_repository.h
     src/ssh_client.cpp
     src/ssh_client.h
-    src/ssh_worker.h
     src/ssh_worker.cpp
+    src/ssh_worker.h
+    src/ssh_connection.cpp
+    src/ssh_connection.h
 )
 
 target_link_libraries(himashinya PRIVATE

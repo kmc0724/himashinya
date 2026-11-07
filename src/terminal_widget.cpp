@@ -48,6 +48,9 @@ terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 	vterm_output_set_callback(vterm, &terminal_widget::output_callback,
 				  this);
 
+	/* Initialize terminal state before receiving SSH output. */
+	vterm_screen_reset(screen, 1);
+
 	setMinimumSize(320, 180);
 }
 

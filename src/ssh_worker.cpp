@@ -64,7 +64,7 @@ void ssh_worker::authenticate(const QString &password)
 	}
 
 	shell_timer = new QTimer(this);
-	shell_timer->setInterval(20);
+	shell_timer->setInterval(5);
 
 	connect(shell_timer, &QTimer::timeout, this, &ssh_worker::poll_shell);
 

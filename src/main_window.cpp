@@ -1,6 +1,7 @@
 #include "main_window.h"
 #include "ssh_connection.h"
 #include "ssh_worker.h"
+#include "terminal_widget.h"
 
 #include <QAction>
 #include <QDialog>
@@ -362,30 +363,32 @@ void main_window::connect_server()
 			connection->authenticate(password);
 		});
 
-	connect(
-	    connection, &ssh_connection::authenticated, this,
-	    [this, connection, server]() {
-		    auto *page = new QWidget;
-		    auto *layout = new QVBoxLayout(page);
+	connect(connection, &ssh_connection::authenticated, this,
+		[this, connection, server]() {
+			auto *terminal = new terminal_widget;
 
-		    auto *label =
-			new QLabel(QString("Connected to %1\n%2@%3:%4")
-				       .arg(server.name)
-				       .arg(server.username)
-				       .arg(server.host)
-				       .arg(server.port));
+			terminal->setProperty(
+			    "ssh_connection",
+			    QVariant::fromValue(
+				static_cast<QObject *>(connection)));
 
-		    label->setAlignment(Qt::AlignCenter);
-		    layout->addWidget(label);
+			connect(connection, &ssh_connection::shell_output,
+				terminal, &terminal_widget::feed_output);
 
-		    page->setProperty("ssh_connection",
-				      QVariant::fromValue(
-					  static_cast<QObject *>(connection)));
+			connect(terminal, &terminal_widget::send_data,
+				connection, &ssh_connection::write_shell);
 
-		    int tab_index = terminal_tabs->addTab(page, server.name);
+			connect(terminal, &terminal_widget::resize_requested,
+				connection, &ssh_connection::resize_shell);
 
-		    terminal_tabs->setCurrentIndex(tab_index);
-	    });
+			connect(connection, &ssh_connection::shell_ready,
+				terminal,
+				[terminal]() { terminal->setFocus(); });
+
+			int tab_index =
+			    terminal_tabs->addTab(terminal, server.name);
+			terminal_tabs->setCurrentIndex(tab_index);
+		});
 
 	connect(connection, &ssh_connection::failed, this,
 		[this, connection](const QString &message) {
@@ -400,17 +403,18 @@ void main_window::connect_server()
 
 void main_window::close_terminal_tab(int index)
 {
-	if (terminal_tabs->count() <= 1)
-		return;
-
 	QWidget *page = terminal_tabs->widget(index);
+
+	if (!page)
+		return;
 
 	auto *connection = qobject_cast<ssh_connection *>(
 	    page->property("ssh_connection").value<QObject *>());
 
+	terminal_tabs->removeTab(index);
+
 	if (connection)
 		connection->close();
 
-	terminal_tabs->removeTab(index);
 	page->deleteLater();
 }

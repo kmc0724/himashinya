@@ -41,7 +41,10 @@ terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 
 	static const VTermScreenCallbacks callbacks = {
 	    .damage = &terminal_widget::damage_callback,
-	    .movecursor = &terminal_widget::cursor_callback};
+	    .movecursor = &terminal_widget::cursor_callback,
+	    .sb_pushline = &terminal_widget::scrollback_pushline,
+	    .sb_popline = &terminal_widget::scrollback_popline,
+	};
 
 	vterm_screen_set_callbacks(screen, &callbacks, this);
 
@@ -127,15 +130,9 @@ QString terminal_widget::cell_text(const VTermScreenCell &cell) const
 				 count);
 }
 
-void terminal_widget::draw_cell(QPainter &painter, int row, int col)
+void terminal_widget::draw_cell(QPainter &painter, int row, int col,
+				const VTermScreenCell &cell)
 {
-	VTermScreenCell cell = {};
-
-	VTermPos pos = {row, col};
-
-	if (!vterm_screen_get_cell(screen, pos, &cell))
-		return;
-
 	if (cell.width == 0)
 		return;
 
@@ -181,11 +178,38 @@ void terminal_widget::paintEvent(QPaintEvent *)
 		return;
 
 	for (int row = 0; row < rows; ++row) {
-		for (int col = 0; col < columns; ++col)
-			draw_cell(painter, row, col);
+		int logical_row =
+		    static_cast<int>(history.size()) - scroll_offset + row;
+
+		for (int col = 0; col < columns; ++col) {
+			VTermScreenCell cell = {};
+
+			if (logical_row < static_cast<int>(history.size())) {
+				if (logical_row < 0)
+					continue;
+
+				const auto &line = history[logical_row].cells;
+
+				if (col >= line.size())
+					continue;
+
+				cell = line[col];
+			} else {
+				int screen_row =
+				    logical_row -
+				    static_cast<int>(history.size());
+
+				VTermPos pos = {screen_row, col};
+
+				if (!vterm_screen_get_cell(screen, pos, &cell))
+					continue;
+			}
+
+			draw_cell(painter, row, col, cell);
+		}
 	}
 
-	if (cursor_visible) {
+	if (scroll_offset == 0 && cursor_visible) {
 		QRectF cursor(cursor_position.col * cell_width,
 			      cursor_position.row * cell_height, cell_width,
 			      cell_height);
@@ -227,6 +251,12 @@ void terminal_widget::keyPressEvent(QKeyEvent *event)
 	if (!vterm) {
 		QWidget::keyPressEvent(event);
 		return;
+	}
+
+	/* Return to the live terminal on keyboard input. */
+	if (scroll_offset != 0) {
+		scroll_offset = 0;
+		update();
 	}
 
 	VTermModifier mod = VTERM_MOD_NONE;
@@ -348,4 +378,72 @@ QVariant terminal_widget::inputMethodQuery(Qt::InputMethodQuery query) const
 		return true;
 
 	return QWidget::inputMethodQuery(query);
+}
+
+int terminal_widget::scrollback_pushline(int cols, const VTermScreenCell *cells,
+					 void *user)
+{
+	auto *self = static_cast<terminal_widget *>(user);
+
+	history_line line;
+	line.cells.resize(cols);
+
+	std::copy_n(cells, cols, line.cells.begin());
+
+	self->history.append(std::move(line));
+
+	if (self->history.size() > max_history_lines)
+		self->history.removeFirst();
+
+	if (self->scroll_offset > 0) {
+		self->scroll_offset =
+		    std::min(self->scroll_offset + 1,
+			     static_cast<int>(self->history.size()));
+	}
+
+	return 1;
+}
+
+int terminal_widget::scrollback_popline(int cols, VTermScreenCell *cells,
+					void *user)
+{
+	auto *self = static_cast<terminal_widget *>(user);
+
+	if (self->history.isEmpty())
+		return 0;
+
+	history_line line = self->history.takeLast();
+
+	int count = std::min(cols, static_cast<int>(line.cells.size()));
+
+	std::copy_n(line.cells.constBegin(), count, cells);
+
+	for (int i = count; i < cols; ++i)
+		cells[i] = {};
+
+	self->scroll_offset = std::min(self->scroll_offset,
+				       static_cast<int>(self->history.size()));
+
+	return 1;
+}
+
+void terminal_widget::wheelEvent(QWheelEvent *event)
+{
+	int steps = event->angleDelta().y() / 120;
+
+	if (steps == 0) {
+		event->ignore();
+		return;
+	}
+
+	scroll_history(steps * 3);
+	event->accept();
+}
+
+void terminal_widget::scroll_history(int lines)
+{
+	scroll_offset = std::clamp(scroll_offset + lines, 0,
+				   static_cast<int>(history.size()));
+
+	update();
 }

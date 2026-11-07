@@ -3,6 +3,8 @@
 
 #include <QByteArray>
 #include <QFont>
+#include <QVector>
+#include <QWheelEvent>
 #include <QWidget>
 
 #ifdef small
@@ -48,7 +50,19 @@ private:
 	static void output_callback(const char *data, size_t len, void *user);
 
 	void update_terminal_size();
-	void draw_cell(QPainter &painter, int row, int col);
+	void draw_cell(QPainter &painter, int row, int col,
+		       const VTermScreenCell &cell);
+
+	static int scrollback_pushline(int cols, const VTermScreenCell *cells,
+				       void *user);
+
+	static int scrollback_popline(int cols, VTermScreenCell *cells,
+				      void *user);
+
+	void wheelEvent(QWheelEvent *event) override;
+
+	void scroll_history(int lines);
+
 	QString cell_text(const VTermScreenCell &cell) const;
 	QColor cell_color(VTermColor color) const;
 
@@ -66,4 +80,14 @@ private:
 
 	VTermPos cursor_position = {0, 0};
 	bool cursor_visible = true;
+
+	struct history_line {
+		QVector<VTermScreenCell> cells;
+	};
+
+	QVector<history_line> history;
+
+	int scroll_offset = 0;
+
+	static constexpr int max_history_lines = 10000;
 };

@@ -5,6 +5,7 @@
 #include <QFont>
 #include <QMouseEvent>
 #include <QPoint>
+#include <QTimer>
 #include <QVector>
 #include <QWheelEvent>
 #include <QWidget>
@@ -76,6 +77,12 @@ private:
 	QString selected_text() const;
 	void copy_selection();
 	void paste_clipboard();
+
+	QTimer *selection_scroll_timer = nullptr;
+	QPoint selection_mouse_position;
+
+	void update_selection_autoscroll();
+	void scroll_selection();
 
 	VTerm *vterm = nullptr;
 	VTermScreen *screen = nullptr;

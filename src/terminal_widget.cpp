@@ -18,6 +18,13 @@
 terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 {
 	setFocusPolicy(Qt::StrongFocus);
+
+	selection_scroll_timer = new QTimer(this);
+	selection_scroll_timer->setInterval(40);
+
+	connect(selection_scroll_timer, &QTimer::timeout, this,
+		&terminal_widget::scroll_selection);
+
 	setAttribute(Qt::WA_InputMethodEnabled);
 	setAttribute(Qt::WA_OpaquePaintEvent);
 
@@ -531,9 +538,12 @@ void terminal_widget::mouseMoveEvent(QMouseEvent *event)
 	if (!selecting)
 		return;
 
-	selection_end = mouse_to_cell(event->position().toPoint());
+	selection_mouse_position = event->position().toPoint();
 
+	selection_end = mouse_to_cell(selection_mouse_position);
 	has_selection = selection_start != selection_end;
+
+	update_selection_autoscroll();
 
 	update();
 	event->accept();
@@ -545,6 +555,8 @@ void terminal_widget::mouseReleaseEvent(QMouseEvent *event)
 		QWidget::mouseReleaseEvent(event);
 		return;
 	}
+
+	selection_scroll_timer->stop();
 
 	if (selecting) {
 		selection_end = mouse_to_cell(event->position().toPoint());
@@ -638,4 +650,62 @@ void terminal_widget::paste_clipboard()
 	update();
 
 	emit send_data(text.toUtf8());
+}
+
+void terminal_widget::update_selection_autoscroll()
+{
+	if (!selecting) {
+		selection_scroll_timer->stop();
+		return;
+	}
+
+	if (selection_mouse_position.y() < 0 ||
+	    selection_mouse_position.y() >= height()) {
+		if (!selection_scroll_timer->isActive())
+			selection_scroll_timer->start();
+	} else {
+		selection_scroll_timer->stop();
+	}
+}
+
+void terminal_widget::scroll_selection()
+{
+	if (!selecting) {
+		selection_scroll_timer->stop();
+		return;
+	}
+
+	int direction = 0;
+
+	if (selection_mouse_position.y() < 0)
+		direction = 1;
+	else if (selection_mouse_position.y() >= height())
+		direction = -1;
+	else {
+		selection_scroll_timer->stop();
+		return;
+	}
+
+	int previous_offset = scroll_offset;
+	int distance = 0;
+
+	if (selection_mouse_position.y() < 0)
+		distance = -selection_mouse_position.y();
+	else if (selection_mouse_position.y() >= height())
+		distance = selection_mouse_position.y() - height() + 1;
+
+	int speed = std::clamp(1 + distance / 20, 1, 12);
+
+	scroll_history(direction * speed);
+
+	selection_end = mouse_to_cell(
+	    QPoint(selection_mouse_position.x(),
+		   std::clamp(selection_mouse_position.y(), 0, height() - 1)));
+
+	has_selection = selection_start != selection_end;
+
+	if (scroll_offset == previous_offset)
+		selection_scroll_timer->stop();
+
+	update();
 }

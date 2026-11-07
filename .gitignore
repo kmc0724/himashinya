@@ -1,0 +1,52 @@
+
+# CMake / Build
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+compile_commands.json
+
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+
+# VS Code
+.vscode/*
+!.vscode/extensions.json
+
+# Executables / Libraries
+*.exe
+*.dll
+*.lib
+*.exp
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Qt generated files
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Secrets / Credentials
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.ppk
+
+# OS
+.DS_Store
+Thumbs.db

@@ -3,6 +3,8 @@
 
 #include <QByteArray>
 #include <QFont>
+#include <QMouseEvent>
+#include <QPoint>
 #include <QVector>
 #include <QWheelEvent>
 #include <QWidget>
@@ -50,7 +52,7 @@ private:
 	static void output_callback(const char *data, size_t len, void *user);
 
 	void update_terminal_size();
-	void draw_cell(QPainter &painter, int row, int col,
+	void draw_cell(QPainter &painter, int row, int col, int logical_row,
 		       const VTermScreenCell &cell);
 
 	static int scrollback_pushline(int cols, const VTermScreenCell *cells,
@@ -65,6 +67,15 @@ private:
 
 	QString cell_text(const VTermScreenCell &cell) const;
 	QColor cell_color(VTermColor color) const;
+
+	void mousePressEvent(QMouseEvent *event) override;
+	void mouseMoveEvent(QMouseEvent *event) override;
+	void mouseReleaseEvent(QMouseEvent *event) override;
+
+	QPoint mouse_to_cell(const QPoint &position) const;
+	QString selected_text() const;
+	void copy_selection();
+	void paste_clipboard();
 
 	VTerm *vterm = nullptr;
 	VTermScreen *screen = nullptr;
@@ -90,4 +101,10 @@ private:
 	int scroll_offset = 0;
 
 	static constexpr int max_history_lines = 10000;
+
+	bool selecting = false;
+	bool has_selection = false;
+
+	QPoint selection_start;
+	QPoint selection_end;
 };

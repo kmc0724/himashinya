@@ -1,11 +1,14 @@
 
 #include "terminal_widget.h"
 
+#include <QClipboard>
 #include <QColor>
 #include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QGuiApplication>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QResizeEvent>
@@ -131,7 +134,7 @@ QString terminal_widget::cell_text(const VTermScreenCell &cell) const
 }
 
 void terminal_widget::draw_cell(QPainter &painter, int row, int col,
-				const VTermScreenCell &cell)
+				int logical_row, const VTermScreenCell &cell)
 {
 	if (cell.width == 0)
 		return;
@@ -164,6 +167,24 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 		painter.setPen(fg);
 
 		painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter, text);
+	}
+
+	if (has_selection) {
+		QPoint start = selection_start;
+		QPoint end = selection_end;
+
+		if (start.y() > end.y() ||
+		    (start.y() == end.y() && start.x() > end.x()))
+			std::swap(start, end);
+
+		bool selected =
+		    (logical_row > start.y() ||
+		     (logical_row == start.y() && col >= start.x())) &&
+		    (logical_row < end.y() ||
+		     (logical_row == end.y() && col <= end.x()));
+
+		if (selected)
+			painter.fillRect(rect, QColor(80, 140, 220, 100));
 	}
 }
 
@@ -205,7 +226,7 @@ void terminal_widget::paintEvent(QPaintEvent *)
 					continue;
 			}
 
-			draw_cell(painter, row, col, cell);
+			draw_cell(painter, row, col, logical_row, cell);
 		}
 	}
 
@@ -253,108 +274,132 @@ void terminal_widget::keyPressEvent(QKeyEvent *event)
 		return;
 	}
 
-	/* Return to the live terminal on keyboard input. */
+	const auto key = event->key();
+	const auto modifiers = event->modifiers();
+
+	const bool ctrl = modifiers.testFlag(Qt::ControlModifier);
+	const bool shift = modifiers.testFlag(Qt::ShiftModifier);
+	const bool alt = modifiers.testFlag(Qt::AltModifier);
+
+	switch (key) {
+	case Qt::Key_Control:
+	case Qt::Key_Shift:
+	case Qt::Key_Alt:
+	case Qt::Key_Meta:
+		event->accept();
+		return;
+	default:
+		break;
+	}
+
+	/* Copy selected text, otherwise forward Ctrl+C to SSH. */
+	if (ctrl && !alt && key == Qt::Key_C) {
+		if (has_selection) {
+			copy_selection();
+			event->accept();
+			return;
+		}
+
+		if (shift) {
+			event->accept();
+			return;
+		}
+	}
+
+	/* Paste clipboard text. */
+	if (ctrl && !alt && key == Qt::Key_V) {
+		paste_clipboard();
+		event->accept();
+		return;
+	}
+
+	/* Return to the live terminal only for actual input. */
 	if (scroll_offset != 0) {
 		scroll_offset = 0;
 		update();
 	}
 
-	VTermModifier mod = VTERM_MOD_NONE;
-
-	if (event->modifiers() & Qt::ShiftModifier)
-		mod = static_cast<VTermModifier>(mod | VTERM_MOD_SHIFT);
-
-	if (event->modifiers() & Qt::ControlModifier)
-		mod = static_cast<VTermModifier>(mod | VTERM_MOD_CTRL);
-
-	if (event->modifiers() & Qt::AltModifier)
-		mod = static_cast<VTermModifier>(mod | VTERM_MOD_ALT);
-
-	VTermKey key;
-
-	switch (event->key()) {
-	case Qt::Key_Return:
-	case Qt::Key_Enter:
-		key = VTERM_KEY_ENTER;
-		break;
-
-	case Qt::Key_Backspace:
-		key = VTERM_KEY_BACKSPACE;
-		break;
-
-	case Qt::Key_Tab:
-		key = VTERM_KEY_TAB;
-		break;
-
-	case Qt::Key_Escape:
-		key = VTERM_KEY_ESCAPE;
-		break;
-
-	case Qt::Key_Up:
-		key = VTERM_KEY_UP;
-		break;
-
-	case Qt::Key_Down:
-		key = VTERM_KEY_DOWN;
-		break;
-
-	case Qt::Key_Left:
-		key = VTERM_KEY_LEFT;
-		break;
-
-	case Qt::Key_Right:
-		key = VTERM_KEY_RIGHT;
-		break;
-
-	case Qt::Key_Home:
-		key = VTERM_KEY_HOME;
-		break;
-
-	case Qt::Key_End:
-		key = VTERM_KEY_END;
-		break;
-
-	case Qt::Key_Insert:
-		key = VTERM_KEY_INS;
-		break;
-
-	case Qt::Key_Delete:
-		key = VTERM_KEY_DEL;
-		break;
-
-	case Qt::Key_PageUp:
-		key = VTERM_KEY_PAGEUP;
-		break;
-
-	case Qt::Key_PageDown:
-		key = VTERM_KEY_PAGEDOWN;
-		break;
-
-	default:
-		if (event->key() >= Qt::Key_F1 && event->key() <= Qt::Key_F12) {
-			key = static_cast<VTermKey>(
-			    VTERM_KEY_FUNCTION(event->key() - Qt::Key_F1 + 1));
-			vterm_keyboard_key(vterm, key, mod);
-			event->accept();
-			return;
-		}
-
-		QString text = event->text();
-
-		if (text.isEmpty()) {
-			QWidget::keyPressEvent(event);
-			return;
-		}
-
-		for (uint codepoint : text.toUcs4()) {
-			vterm_keyboard_unichar(vterm, codepoint, mod);
-		}
-
-		event->accept();
-		return;
+	if (has_selection) {
+		has_selection = false;
+		selecting = false;
+		update();
 	}
 
-	vterm_keyboard_key(vterm, key, mod);
+	VTermModifier mod = VTERM_MOD_NONE;
+
+	if (shift)
+		mod = static_cast<VTermModifier>(mod | VTERM_MOD_SHIFT);
+
+	if (alt)
+		mod = static_cast<VTermModifier>(mod | VTERM_MOD_ALT);
+
+	if (ctrl)
+		mod = static_cast<VTermModifier>(mod | VTERM_MOD_CTRL);
+
+	VTermKey vkey = VTERM_KEY_NONE;
+
+	switch (key) {
+	case Qt::Key_Return:
+	case Qt::Key_Enter:
+		vkey = VTERM_KEY_ENTER;
+		break;
+	case Qt::Key_Backspace:
+		vkey = VTERM_KEY_BACKSPACE;
+		break;
+	case Qt::Key_Tab:
+		vkey = VTERM_KEY_TAB;
+		break;
+	case Qt::Key_Escape:
+		vkey = VTERM_KEY_ESCAPE;
+		break;
+	case Qt::Key_Up:
+		vkey = VTERM_KEY_UP;
+		break;
+	case Qt::Key_Down:
+		vkey = VTERM_KEY_DOWN;
+		break;
+	case Qt::Key_Left:
+		vkey = VTERM_KEY_LEFT;
+		break;
+	case Qt::Key_Right:
+		vkey = VTERM_KEY_RIGHT;
+		break;
+	case Qt::Key_Home:
+		vkey = VTERM_KEY_HOME;
+		break;
+	case Qt::Key_End:
+		vkey = VTERM_KEY_END;
+		break;
+	case Qt::Key_Insert:
+		vkey = VTERM_KEY_INS;
+		break;
+	case Qt::Key_Delete:
+		vkey = VTERM_KEY_DEL;
+		break;
+	case Qt::Key_PageUp:
+		vkey = VTERM_KEY_PAGEUP;
+		break;
+	case Qt::Key_PageDown:
+		vkey = VTERM_KEY_PAGEDOWN;
+		break;
+	default:
+		if (key >= Qt::Key_F1 && key <= Qt::Key_F12)
+			vkey = static_cast<VTermKey>(
+			    VTERM_KEY_FUNCTION(key - Qt::Key_F1 + 1));
+		break;
+	}
+
+	if (vkey != VTERM_KEY_NONE) {
+		vterm_keyboard_key(vterm, vkey, mod);
+	} else if (ctrl && key >= Qt::Key_A && key <= Qt::Key_Z) {
+		vterm_keyboard_unichar(vterm, 'a' + key - Qt::Key_A, mod);
+	} else {
+		const QString text = event->text();
+
+		for (uint codepoint : text.toUcs4())
+			vterm_keyboard_unichar(vterm, codepoint, mod);
+	}
+
 	event->accept();
 }
 
@@ -446,4 +491,151 @@ void terminal_widget::scroll_history(int lines)
 				   static_cast<int>(history.size()));
 
 	update();
+}
+
+QPoint terminal_widget::mouse_to_cell(const QPoint &position) const
+{
+	int col = std::clamp(static_cast<int>(position.x() / cell_width), 0,
+			     columns - 1);
+
+	int row = std::clamp(static_cast<int>(position.y() / cell_height), 0,
+			     rows - 1);
+
+	int logical_row =
+	    static_cast<int>(history.size()) - scroll_offset + row;
+
+	return QPoint(col, logical_row);
+}
+
+void terminal_widget::mousePressEvent(QMouseEvent *event)
+{
+	if (event->button() != Qt::LeftButton) {
+		QWidget::mousePressEvent(event);
+		return;
+	}
+
+	setFocus();
+
+	selecting = true;
+	has_selection = false;
+
+	selection_start = mouse_to_cell(event->position().toPoint());
+	selection_end = selection_start;
+
+	update();
+	event->accept();
+}
+
+void terminal_widget::mouseMoveEvent(QMouseEvent *event)
+{
+	if (!selecting)
+		return;
+
+	selection_end = mouse_to_cell(event->position().toPoint());
+
+	has_selection = selection_start != selection_end;
+
+	update();
+	event->accept();
+}
+
+void terminal_widget::mouseReleaseEvent(QMouseEvent *event)
+{
+	if (event->button() != Qt::LeftButton) {
+		QWidget::mouseReleaseEvent(event);
+		return;
+	}
+
+	if (selecting) {
+		selection_end = mouse_to_cell(event->position().toPoint());
+		has_selection = selection_start != selection_end;
+		selecting = false;
+		update();
+	}
+
+	event->accept();
+}
+
+QString terminal_widget::selected_text() const
+{
+	if (!has_selection || !screen)
+		return {};
+
+	QPoint start = selection_start;
+	QPoint end = selection_end;
+
+	if (start.y() > end.y() ||
+	    (start.y() == end.y() && start.x() > end.x()))
+		std::swap(start, end);
+
+	QString result;
+
+	for (int row = start.y(); row <= end.y(); ++row) {
+		QString line;
+
+		int first_col = (row == start.y()) ? start.x() : 0;
+		int last_col = (row == end.y()) ? end.x() : columns - 1;
+
+		for (int col = first_col; col <= last_col; ++col) {
+			VTermScreenCell cell = {};
+
+			if (row < history.size()) {
+				const auto &cells = history[row].cells;
+
+				if (col >= cells.size())
+					continue;
+
+				cell = cells[col];
+			} else {
+				VTermPos pos = {
+				    row - static_cast<int>(history.size()),
+				    col};
+
+				if (!vterm_screen_get_cell(screen, pos, &cell))
+					continue;
+			}
+
+			if (cell.width == 0)
+				continue;
+
+			line += cell_text(cell);
+		}
+
+		result += line.trimmed();
+
+		if (row != end.y())
+			result += '\n';
+	}
+
+	return result;
+}
+
+void terminal_widget::copy_selection()
+{
+	if (!has_selection)
+		return;
+
+	QGuiApplication::clipboard()->setText(selected_text());
+}
+
+void terminal_widget::paste_clipboard()
+{
+	if (!vterm)
+		return;
+
+	QString text = QGuiApplication::clipboard()->text();
+
+	if (text.isEmpty())
+		return;
+
+	// Windows 줄바꿈을 터미널 입력 형식으로 정규화
+	text.replace("\r\n", "\n");
+	text.replace('\r', '\n');
+	text.replace('\n', '\r');
+
+	// 붙여넣기는 실제 입력이므로 최신 화면으로 이동
+	scroll_offset = 0;
+	update();
+
+	emit send_data(text.toUtf8());
 }

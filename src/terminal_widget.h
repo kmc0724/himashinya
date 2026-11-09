@@ -84,6 +84,7 @@ private:
 
 	void update_selection_autoscroll();
 	void scroll_selection();
+	void update_selection_area(const QPoint &first, const QPoint &second);
 
 	VTerm *vterm = nullptr;
 	VTermScreen *screen = nullptr;
@@ -92,6 +93,8 @@ private:
 	QFont terminal_font;
 	QString ime_preedit;
 	bool ime_composing = false;
+	int ime_preedit_cursor = 0;
+	bool ime_preedit_cursor_visible = true;
 
 	qreal cell_width = 0;
 	qreal cell_height = 0;

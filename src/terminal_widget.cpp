@@ -430,21 +430,38 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 	}
 }
 
-void terminal_widget::paintEvent(QPaintEvent *)
+void terminal_widget::paintEvent(QPaintEvent *event)
 {
 	QPainter painter(this);
 
-	painter.fillRect(rect(), QColor("#1e1e1e"));
+	const QRect dirty_rect = event->region().boundingRect().intersected(rect());
+	if (dirty_rect.isEmpty())
+		return;
+
+	painter.fillRect(dirty_rect, QColor("#1e1e1e"));
 	painter.setFont(terminal_font);
 
 	if (!screen)
 		return;
 
-	for (int row = 0; row < rows; ++row) {
+	const int first_row =
+		std::clamp(static_cast<int>(dirty_rect.top() / cell_height),
+			   0, rows - 1);
+	const int last_row =
+		std::clamp(static_cast<int>(dirty_rect.bottom() / cell_height),
+			   0, rows - 1);
+	const int first_col =
+		std::clamp(static_cast<int>(dirty_rect.left() / cell_width), 0,
+			   columns - 1);
+	const int last_col =
+		std::clamp(static_cast<int>(dirty_rect.right() / cell_width), 0,
+			   columns - 1);
+
+	for (int row = first_row; row <= last_row; ++row) {
 		int logical_row =
 		    static_cast<int>(history.size()) - scroll_offset + row;
 
-		for (int col = 0; col < columns; ++col) {
+		for (int col = first_col; col <= last_col; ++col) {
 			VTermScreenCell cell = {};
 
 			if (logical_row < static_cast<int>(history.size())) {
@@ -472,7 +489,7 @@ void terminal_widget::paintEvent(QPaintEvent *)
 		}
 	}
 
-	if (scroll_offset == 0 && cursor_visible) {
+	if (scroll_offset == 0 && cursor_visible && ime_preedit.isEmpty()) {
 		QRectF cursor(cursor_position.col * cell_width,
 			      cursor_position.row * cell_height, cell_width,
 			      cell_height);
@@ -486,18 +503,38 @@ void terminal_widget::paintEvent(QPaintEvent *)
 		const int row = std::clamp(cursor_position.row, 0, rows - 1);
 		const qreal x = col * cell_width;
 		const qreal y = row * cell_height;
-		QRectF preedit_rect(x, y,
-				    std::max<qreal>(cell_width, width() - x),
-				    cell_height);
+		const qreal available_width = std::max<qreal>(0, width() - x);
+		const QFont font = cell_font(terminal_font, ime_preedit);
+		const QFontMetricsF metrics(font);
+		const qreal text_width = metrics.horizontalAdvance(ime_preedit);
+		const qreal preedit_width =
+			std::min(available_width,
+				 std::max<qreal>(cell_width, text_width));
+		const QRectF preedit_rect(x, y, preedit_width, cell_height);
 
 		painter.fillRect(preedit_rect, QColor(55, 55, 55, 220));
-		painter.setFont(cell_font(terminal_font, ime_preedit));
+		painter.setFont(font);
 		painter.setPen(QColor("#ffffff"));
-		painter.drawText(preedit_rect,
-				 Qt::AlignLeft | Qt::AlignVCenter,
-				 ime_preedit);
-		painter.drawLine(preedit_rect.bottomLeft(),
-				 preedit_rect.bottomRight());
+		const qreal baseline =
+			y + (cell_height - metrics.height()) / 2 + metrics.ascent();
+		painter.drawText(QPointF(x, baseline), ime_preedit);
+
+		const qreal underline_width =
+			std::min(available_width, text_width);
+		painter.drawLine(QPointF(x, y + cell_height - 1),
+				 QPointF(x + underline_width,
+					 y + cell_height - 1));
+
+		if (ime_preedit_cursor_visible) {
+			const QString prefix =
+				ime_preedit.left(ime_preedit_cursor);
+			const qreal cursor_x =
+				x + std::min(available_width,
+					     metrics.horizontalAdvance(prefix));
+			painter.drawLine(QPointF(cursor_x, y + 2),
+					 QPointF(cursor_x,
+						 y + cell_height - 2));
+		}
 	}
 }
 
@@ -706,6 +743,21 @@ void terminal_widget::inputMethodEvent(QInputMethodEvent *event)
 	}
 	ime_preedit = event->preeditString();
 	ime_composing = !ime_preedit.isEmpty();
+	ime_preedit_cursor = ime_preedit.size();
+	ime_preedit_cursor_visible = !ime_preedit.isEmpty();
+
+	for (const QInputMethodEvent::Attribute &attribute :
+	     event->attributes()) {
+		if (attribute.type == QInputMethodEvent::Cursor) {
+			ime_preedit_cursor = static_cast<int>(
+				std::clamp<qsizetype>(
+					attribute.start, 0,
+					ime_preedit.size()));
+			ime_preedit_cursor_visible =
+				attribute.length != 0;
+			break;
+		}
+	}
 
 	const QString text = event->commitString();
 
@@ -729,8 +781,20 @@ QVariant terminal_widget::inputMethodQuery(Qt::InputMethodQuery query) const
 	if (query == Qt::ImCursorRectangle) {
 		const int col = std::clamp(cursor_position.col, 0, columns - 1);
 		const int row = std::clamp(cursor_position.row, 0, rows - 1);
-		return QRectF(col * cell_width, row * cell_height, cell_width,
-			      cell_height);
+		qreal x = col * cell_width;
+		qreal y = row * cell_height;
+		qreal width = cell_width;
+
+		if (!ime_preedit.isEmpty()) {
+			const QFont font =
+				cell_font(terminal_font, ime_preedit);
+			const QFontMetricsF metrics(font);
+			x += metrics.horizontalAdvance(
+				ime_preedit.left(ime_preedit_cursor));
+			width = 1;
+		}
+
+		return QRectF(x, y, width, cell_height);
 	}
 
 	return QWidget::inputMethodQuery(query);
@@ -829,6 +893,9 @@ void terminal_widget::mousePressEvent(QMouseEvent *event)
 
 	setFocus();
 
+	if (has_selection)
+		update_selection_area(selection_start, selection_end);
+
 	selecting = true;
 	has_selection = false;
 
@@ -844,6 +911,7 @@ void terminal_widget::mouseMoveEvent(QMouseEvent *event)
 	if (!selecting)
 		return;
 
+	const QPoint previous_end = selection_end;
 	selection_mouse_position = event->position().toPoint();
 
 	selection_end = mouse_to_cell(selection_mouse_position);
@@ -851,7 +919,7 @@ void terminal_widget::mouseMoveEvent(QMouseEvent *event)
 
 	update_selection_autoscroll();
 
-	update();
+	update_selection_area(previous_end, selection_end);
 	event->accept();
 }
 
@@ -865,10 +933,11 @@ void terminal_widget::mouseReleaseEvent(QMouseEvent *event)
 	selection_scroll_timer->stop();
 
 	if (selecting) {
+		const QPoint previous_end = selection_end;
 		selection_end = mouse_to_cell(event->position().toPoint());
 		has_selection = selection_start != selection_end;
 		selecting = false;
-		update();
+		update_selection_area(previous_end, selection_end);
 	}
 
 	event->accept();
@@ -992,7 +1061,8 @@ void terminal_widget::scroll_selection()
 		return;
 	}
 
-	int previous_offset = scroll_offset;
+	const int previous_offset = scroll_offset;
+	const QPoint previous_end = selection_end;
 	int distance = 0;
 
 	if (selection_mouse_position.y() < 0)
@@ -1013,5 +1083,43 @@ void terminal_widget::scroll_selection()
 	if (scroll_offset == previous_offset)
 		selection_scroll_timer->stop();
 
-	update();
+	if (scroll_offset != previous_offset)
+		update();
+	else
+		update_selection_area(previous_end, selection_end);
+}
+
+void terminal_widget::update_selection_area(const QPoint &first,
+					   const QPoint &second)
+{
+	const int top_row = std::min(first.y(), second.y());
+	const int bottom_row = std::max(first.y(), second.y());
+	int left_col = 0;
+	int right_col = columns - 1;
+
+	if (top_row == bottom_row) {
+		left_col = std::max(0, std::min(first.x(), second.x()) - 1);
+		right_col =
+			std::min(columns - 1,
+				 std::max(first.x(), second.x()) + 1);
+	}
+
+	const int first_visible_row =
+		static_cast<int>(history.size()) - scroll_offset;
+	const int screen_top = std::max(top_row, first_visible_row);
+	const int screen_bottom =
+		std::min(bottom_row, first_visible_row + rows - 1);
+
+	if (screen_top > screen_bottom)
+		return;
+
+	const int top = (screen_top - first_visible_row) * cell_height;
+	const int bottom =
+		(screen_bottom - first_visible_row + 1) * cell_height;
+	const int left = static_cast<int>(left_col * cell_width);
+	const int right = static_cast<int>(
+		std::min<qreal>(width(), (right_col + 1) * cell_width));
+
+	update(QRect(left, top, std::max(1, right - left),
+		     std::max(1, bottom - top)));
 }

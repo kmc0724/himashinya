@@ -55,6 +55,27 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 
 	connect(worker, &ssh_worker::shell_output, this,
 		&ssh_connection::shell_output);
+
+	connect(this, &ssh_connection::sftp_list_requested, worker,
+		&ssh_worker::list_sftp_directory, Qt::QueuedConnection);
+
+	connect(this, &ssh_connection::sftp_download_requested, worker,
+		&ssh_worker::download_sftp_file, Qt::QueuedConnection);
+
+	connect(this, &ssh_connection::sftp_upload_requested, worker,
+		&ssh_worker::upload_sftp_file, Qt::QueuedConnection);
+
+	connect(worker, &ssh_worker::sftp_ready, this,
+		&ssh_connection::sftp_ready);
+
+	connect(worker, &ssh_worker::sftp_directory_list, this,
+		&ssh_connection::sftp_directory_list);
+
+	connect(worker, &ssh_worker::sftp_transfer_progress, this,
+		&ssh_connection::sftp_transfer_progress);
+
+	connect(worker, &ssh_worker::sftp_transfer_finished, this,
+		&ssh_connection::sftp_transfer_finished);
 }
 
 ssh_connection::~ssh_connection()
@@ -116,6 +137,30 @@ void ssh_connection::resize_shell(int columns, int rows)
 {
 	if (!closing)
 		emit shell_resize_requested(columns, rows);
+}
+
+void ssh_connection::list_sftp_directory(quint64 request_id,
+					 const QString &path)
+{
+	if (!closing)
+		emit sftp_list_requested(request_id, path);
+}
+
+void ssh_connection::download_sftp_file(quint64 request_id,
+					const QString &remote_path,
+					const QString &local_path)
+{
+	if (!closing)
+		emit sftp_download_requested(request_id, remote_path,
+					     local_path);
+}
+
+void ssh_connection::upload_sftp_file(quint64 request_id,
+				      const QString &local_path,
+				      const QString &remote_path)
+{
+	if (!closing)
+		emit sftp_upload_requested(request_id, local_path, remote_path);
 }
 
 bool ssh_connection::is_finished() const

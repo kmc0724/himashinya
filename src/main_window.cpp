@@ -4,12 +4,16 @@
 #include "terminal_widget.h"
 
 #include <QAction>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDebug>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QFontDialog>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -17,8 +21,10 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTabWidget>
@@ -28,6 +34,8 @@
 #include <QVariant>
 #include <QWidget>
 #include <QtMath>
+
+#include <algorithm>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -94,13 +102,73 @@ void main_window::setup_ui()
 	auto *files_page = new QWidget;
 	auto *files_layout = new QVBoxLayout(files_page);
 
-	auto *files_label = new QLabel("Connect to a server to browse files.");
+	sftp_connections = new QComboBox;
+	sftp_connections->addItem("Connect to a server first");
+	sftp_connections->setEnabled(false);
+	files_layout->addWidget(sftp_connections);
 
-	files_label->setWordWrap(true);
-	files_layout->addWidget(files_label);
-	files_layout->addStretch();
+	auto *path_layout = new QHBoxLayout;
+	sftp_path = new QLineEdit;
+	sftp_path->setPlaceholderText("Remote directory");
+	sftp_go_button = new QPushButton("Go");
+	sftp_refresh_button = new QPushButton("Refresh");
+	path_layout->addWidget(sftp_path, 1);
+	path_layout->addWidget(sftp_go_button);
+	path_layout->addWidget(sftp_refresh_button);
+	files_layout->addLayout(path_layout);
+
+	sftp_file_list = new QListWidget;
+	files_layout->addWidget(sftp_file_list, 1);
+
+	auto *transfer_layout = new QHBoxLayout;
+	sftp_upload_button = new QPushButton("Upload");
+	sftp_download_button = new QPushButton("Download");
+	transfer_layout->addWidget(sftp_upload_button);
+	transfer_layout->addWidget(sftp_download_button);
+	files_layout->addLayout(transfer_layout);
+
+	sftp_progress = new QProgressBar;
+	sftp_progress->setRange(0, 100);
+	sftp_progress->setValue(0);
+	sftp_progress->setTextVisible(false);
+	files_layout->addWidget(sftp_progress);
+
+	sftp_status = new QLabel("Connect to a server to browse files.");
+	sftp_status->setWordWrap(true);
+	files_layout->addWidget(sftp_status);
 
 	sidebar_tabs->addTab(files_page, "Files");
+
+	connect(sftp_connections,
+		qOverload<int>(&QComboBox::currentIndexChanged), this,
+		[this](int) {
+			const int index = sftp_connections->currentIndex();
+			if (index < 0)
+				return;
+			const QString path =
+			    sftp_connections
+				->itemData(index, Qt::UserRole + 1)
+				.toString();
+			sftp_path->setText(path);
+			update_sftp_controls();
+			refresh_sftp_directory();
+		});
+	connect(sftp_go_button, &QPushButton::clicked, this, [this]() {
+		navigate_sftp_directory(sftp_path->text());
+	});
+	connect(sftp_path, &QLineEdit::returnPressed, this, [this]() {
+		navigate_sftp_directory(sftp_path->text());
+	});
+	connect(sftp_refresh_button, &QPushButton::clicked, this,
+		&main_window::refresh_sftp_directory);
+	connect(sftp_file_list, &QListWidget::currentItemChanged, this,
+		[this]() { update_sftp_controls(); });
+	connect(sftp_file_list, &QListWidget::itemDoubleClicked, this,
+		&main_window::open_sftp_item);
+	connect(sftp_upload_button, &QPushButton::clicked, this,
+		&main_window::upload_sftp_file);
+	connect(sftp_download_button, &QPushButton::clicked, this,
+		&main_window::download_sftp_file);
 
 	/* Terminal area */
 	terminal_tabs = new QTabWidget(splitter);
@@ -164,6 +232,7 @@ void main_window::setup_ui()
 	splitter->setSizes({280, 920});
 
 	setCentralWidget(splitter);
+	update_sftp_controls();
 }
 
 bool main_window::nativeEvent(const QByteArray &event_type, void *message,
@@ -600,6 +669,134 @@ void main_window::connect_server()
 			terminal_tabs->setCurrentIndex(tab_index);
 		});
 
+	connect(connection, &ssh_connection::sftp_ready, this,
+		[this, connection, server](const QString &home_path,
+					   const QString &error) {
+			if (!error.isEmpty()) {
+				sftp_status->setText(
+				    QString("SFTP unavailable: %1").arg(error));
+				return;
+			}
+
+			if (sftp_connections->count() == 1 &&
+			    !sftp_connections->itemData(0).isValid())
+				sftp_connections->clear();
+
+			const QSignalBlocker blocker(sftp_connections);
+			const int index = sftp_connections->count();
+			sftp_connections->addItem(
+			    server.name,
+			    QVariant::fromValue(
+				static_cast<QObject *>(connection)));
+			sftp_connections->setItemData(index, home_path,
+						      Qt::UserRole + 1);
+			sftp_connections->setEnabled(true);
+			sftp_connections->setCurrentIndex(index);
+			sftp_path->setText(home_path);
+			update_sftp_controls();
+			refresh_sftp_directory();
+		});
+
+	connect(connection, &ssh_connection::sftp_directory_list, this,
+		[this, connection](quint64 request_id,
+				   const QString &canonical_path,
+				   const QVariantList &entries,
+				   const QString &error) {
+			if (request_id != active_sftp_request_id ||
+			    sftp_request_connection != connection)
+				return;
+
+			sftp_request_connection.clear();
+			if (!error.isEmpty()) {
+				sftp_status->setText(error);
+				return;
+			}
+
+			sftp_path->setText(canonical_path);
+			const int index = sftp_connections->currentIndex();
+			if (index >= 0)
+				sftp_connections->setItemData(
+				    index, canonical_path, Qt::UserRole + 1);
+
+			QVariantList sorted_entries = entries;
+			std::stable_sort(
+			    sorted_entries.begin(), sorted_entries.end(),
+			    [](const QVariant &left, const QVariant &right) {
+				    const QVariantMap left_entry =
+					left.toMap();
+				    const QVariantMap right_entry =
+					right.toMap();
+				    const bool left_is_directory =
+					left_entry.value("directory").toBool();
+				    const bool right_is_directory =
+					right_entry.value("directory")
+					    .toBool();
+				    if (left_is_directory !=
+					right_is_directory)
+					    return left_is_directory;
+				    return QString::localeAwareCompare(
+					       left_entry.value("name")
+						   .toString(),
+					       right_entry.value("name")
+						   .toString()) < 0;
+			    });
+
+			sftp_file_list->clear();
+			for (const QVariant &value : sorted_entries) {
+				const QVariantMap entry = value.toMap();
+				const QString name =
+				    entry.value("name").toString();
+				const bool is_directory =
+				    entry.value("directory").toBool();
+				const qulonglong size =
+				    entry.value("size").toULongLong();
+				auto *item = new QListWidgetItem(
+				    is_directory
+					? QString("[DIR] %1").arg(name)
+					: QString("%1    %2 bytes")
+					      .arg(name)
+					      .arg(size),
+				    sftp_file_list);
+				item->setData(Qt::UserRole, name);
+				item->setData(Qt::UserRole + 1,
+					      is_directory);
+			}
+			sftp_status->setText(
+			    QString("%1 items").arg(entries.size()));
+			update_sftp_controls();
+		});
+
+	connect(connection, &ssh_connection::sftp_transfer_progress, this,
+		[this](quint64 request_id, quint64 transferred,
+		       quint64 total) {
+			if (request_id != active_sftp_request_id)
+				return;
+
+			const int percent =
+			    total == 0
+				? 100
+				: static_cast<int>(
+				      qMin(100.0,
+					   static_cast<double>(transferred) *
+					       100.0 /
+					       static_cast<double>(total)));
+			sftp_progress->setValue(percent);
+			sftp_status->setText(
+			    QString("%1 %2 / %3 bytes")
+				.arg(sftp_transfer_is_upload ? "Uploading"
+							     : "Downloading")
+				.arg(transferred)
+				.arg(total));
+		});
+
+	connect(connection, &ssh_connection::sftp_transfer_finished, this,
+		&main_window::finish_sftp_transfer);
+
+	connect(connection, &ssh_connection::finished, this,
+		[this, connection]() {
+			remove_sftp_connection(connection);
+		});
+
 	connect(connection, &ssh_connection::failed, this,
 		[this, connection](const QString &message) {
 			if (!message.isEmpty()) {
@@ -611,6 +808,202 @@ void main_window::connect_server()
 		});
 
 	connection->start();
+}
+
+void main_window::refresh_sftp_directory()
+{
+	if (sftp_transfer_active)
+		return;
+
+	const int index = sftp_connections->currentIndex();
+	if (index < 0) {
+		sftp_status->setText(
+		    "Connect to a server to browse files.");
+		return;
+	}
+
+	auto *connection = qobject_cast<ssh_connection *>(
+	    sftp_connections->itemData(index).value<QObject *>());
+	if (!connection) {
+		sftp_status->setText("The selected connection is unavailable.");
+		return;
+	}
+
+	active_sftp_request_id = next_sftp_request_id++;
+	sftp_request_connection = connection;
+	sftp_file_list->clear();
+	sftp_status->setText("Loading remote directory...");
+	connection->list_sftp_directory(active_sftp_request_id,
+					sftp_path->text());
+}
+
+void main_window::navigate_sftp_directory(const QString &path)
+{
+	if (sftp_transfer_active)
+		return;
+	sftp_path->setText(path);
+	refresh_sftp_directory();
+}
+
+void main_window::open_sftp_item(QListWidgetItem *item)
+{
+	if (!item)
+		return;
+
+	const QString name = item->data(Qt::UserRole).toString();
+	if (item->data(Qt::UserRole + 1).toBool()) {
+		QString path = sftp_path->text();
+		if (!path.endsWith('/'))
+			path.append('/');
+		navigate_sftp_directory(path + name);
+		return;
+	}
+
+	download_sftp_file();
+}
+
+void main_window::upload_sftp_file()
+{
+	if (sftp_transfer_active)
+		return;
+
+	const int index = sftp_connections->currentIndex();
+	if (index < 0)
+		return;
+	auto *connection = qobject_cast<ssh_connection *>(
+	    sftp_connections->itemData(index).value<QObject *>());
+	if (!connection)
+		return;
+
+	const QString local_path = QFileDialog::getOpenFileName(
+	    this, "Select a file to upload");
+	if (local_path.isEmpty())
+		return;
+
+	QString remote_path = sftp_path->text();
+	if (!remote_path.endsWith('/'))
+		remote_path.append('/');
+	remote_path.append(QFileInfo(local_path).fileName());
+
+	active_sftp_request_id = next_sftp_request_id++;
+	sftp_request_connection = connection;
+	sftp_transfer_active = true;
+	sftp_transfer_is_upload = true;
+	sftp_progress->setValue(0);
+	update_sftp_controls();
+	connection->upload_sftp_file(active_sftp_request_id, local_path,
+				     remote_path);
+}
+
+void main_window::download_sftp_file()
+{
+	if (sftp_transfer_active)
+		return;
+
+	auto *item = sftp_file_list->currentItem();
+	if (!item || item->data(Qt::UserRole + 1).toBool())
+		return;
+
+	const int index = sftp_connections->currentIndex();
+	if (index < 0)
+		return;
+	auto *connection = qobject_cast<ssh_connection *>(
+	    sftp_connections->itemData(index).value<QObject *>());
+	if (!connection)
+		return;
+
+	const QString name = item->data(Qt::UserRole).toString();
+	const QString local_path = QFileDialog::getSaveFileName(
+	    this, "Save downloaded file", name);
+	if (local_path.isEmpty())
+		return;
+
+	QString remote_path = sftp_path->text();
+	if (!remote_path.endsWith('/'))
+		remote_path.append('/');
+	remote_path.append(name);
+
+	active_sftp_request_id = next_sftp_request_id++;
+	sftp_request_connection = connection;
+	sftp_transfer_active = true;
+	sftp_transfer_is_upload = false;
+	sftp_progress->setValue(0);
+	update_sftp_controls();
+	connection->download_sftp_file(active_sftp_request_id, remote_path,
+				       local_path);
+}
+
+void main_window::remove_sftp_connection(ssh_connection *connection)
+{
+	for (int index = sftp_connections->count() - 1; index >= 0; --index) {
+		auto *candidate = qobject_cast<ssh_connection *>(
+		    sftp_connections->itemData(index).value<QObject *>());
+		if (candidate == connection)
+			sftp_connections->removeItem(index);
+	}
+
+	if (sftp_request_connection == connection) {
+		sftp_request_connection.clear();
+		if (sftp_transfer_active) {
+			sftp_transfer_active = false;
+			sftp_status->setText("The connection was closed.");
+			sftp_progress->setValue(0);
+		}
+	}
+
+	if (sftp_connections->count() == 0) {
+		sftp_connections->addItem("Connect to a server first");
+		sftp_connections->setEnabled(false);
+		sftp_path->clear();
+		sftp_file_list->clear();
+		sftp_status->setText(
+		    "Connect to a server to browse files.");
+	}
+	update_sftp_controls();
+}
+
+void main_window::update_sftp_controls()
+{
+	const int index = sftp_connections->currentIndex();
+	const bool has_connection =
+	    index >= 0 &&
+	    qobject_cast<ssh_connection *>(
+		sftp_connections->itemData(index).value<QObject *>());
+	const bool can_operate = has_connection && !sftp_transfer_active;
+	sftp_connections->setEnabled(can_operate);
+	sftp_path->setEnabled(can_operate);
+	sftp_go_button->setEnabled(can_operate);
+	sftp_refresh_button->setEnabled(can_operate);
+	sftp_file_list->setEnabled(can_operate);
+	sftp_upload_button->setEnabled(can_operate);
+	sftp_download_button->setEnabled(
+	    can_operate && sftp_file_list->currentItem() &&
+	    !sftp_file_list->currentItem()
+		 ->data(Qt::UserRole + 1)
+		 .toBool());
+}
+
+void main_window::finish_sftp_transfer(quint64 request_id, bool success,
+				       const QString &error)
+{
+	if (request_id != active_sftp_request_id)
+		return;
+
+	sftp_request_connection.clear();
+	sftp_transfer_active = false;
+	sftp_progress->setValue(success ? 100 : 0);
+	if (success) {
+		sftp_status->setText(
+		    sftp_transfer_is_upload ? "Upload complete."
+					    : "Download complete.");
+	} else {
+		sftp_status->setText(error);
+		QMessageBox::warning(this, "SFTP Transfer Failed", error);
+	}
+	update_sftp_controls();
+
+	if (success && sftp_transfer_is_upload)
+		refresh_sftp_directory();
 }
 
 void main_window::close_terminal_tab(int index)
@@ -628,6 +1021,7 @@ void main_window::close_terminal_tab(int index)
 
 	if (!connection)
 		return;
+	remove_sftp_connection(connection);
 
 	if (connection->is_finished()) {
 		connection->deleteLater();

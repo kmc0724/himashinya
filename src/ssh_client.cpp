@@ -1,7 +1,10 @@
 #include "ssh_client.h"
 
 #include <QByteArray>
+#include <QFile>
+#include <QSaveFile>
 
+#include <fcntl.h>
 #include <limits>
 
 ssh_client::~ssh_client()
@@ -174,6 +177,11 @@ void ssh_client::disconnect()
 {
 	authenticated = false;
 
+	if (sftp) {
+		sftp_free(sftp);
+		sftp = nullptr;
+	}
+
 	close_shell();
 
 	if (!session)
@@ -333,6 +341,287 @@ void ssh_client::close_shell()
 
 	ssh_channel_free(shell_channel);
 	shell_channel = nullptr;
+}
+
+bool ssh_client::initialize_sftp(QString &home_path)
+{
+	home_path.clear();
+
+	if (!is_authenticated()) {
+		error_message = "SSH session is not authenticated.";
+		return false;
+	}
+
+	if (sftp) {
+		sftp_free(sftp);
+		sftp = nullptr;
+	}
+
+	sftp = sftp_new(session);
+	if (!sftp) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	if (sftp_init(sftp) != SSH_OK) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		sftp_free(sftp);
+		sftp = nullptr;
+		return false;
+	}
+
+	char *path = sftp_canonicalize_path(sftp, ".");
+	if (!path) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		sftp_free(sftp);
+		sftp = nullptr;
+		return false;
+	}
+
+	home_path = QString::fromUtf8(path);
+	ssh_string_free_char(path);
+	error_message.clear();
+	return true;
+}
+
+bool ssh_client::list_sftp_directory(const QString &path,
+				     QString &canonical_path,
+				     QVariantList &entries)
+{
+	entries.clear();
+	canonical_path.clear();
+	if (!sftp) {
+		error_message = "SFTP session is not initialized.";
+		return false;
+	}
+
+	const QByteArray path_bytes = path.toUtf8();
+	char *resolved_path =
+	    sftp_canonicalize_path(sftp, path_bytes.constData());
+	if (!resolved_path) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	canonical_path = QString::fromUtf8(resolved_path);
+	ssh_string_free_char(resolved_path);
+
+	const QByteArray canonical_path_bytes = canonical_path.toUtf8();
+	sftp_dir directory =
+	    sftp_opendir(sftp, canonical_path_bytes.constData());
+	if (!directory) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	bool success = true;
+	while (true) {
+		sftp_attributes attributes = sftp_readdir(sftp, directory);
+		if (!attributes) {
+			if (!sftp_dir_eof(directory)) {
+				error_message =
+				    QString::fromUtf8(ssh_get_error(session));
+				success = false;
+			}
+			break;
+		}
+
+		const QString name = QString::fromUtf8(attributes->name);
+		if (name != "." && name != "..") {
+			QVariantMap entry;
+			entry.insert("name", name);
+			entry.insert(
+			    "directory",
+			    attributes->type == SSH_FILEXFER_TYPE_DIRECTORY);
+			entry.insert("size",
+				     QVariant::fromValue<qulonglong>(
+					 attributes->size));
+			entries.append(entry);
+		}
+		sftp_attributes_free(attributes);
+	}
+
+	if (sftp_closedir(directory) != SSH_OK && success) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		success = false;
+	}
+
+	if (success)
+		error_message.clear();
+	return success;
+}
+
+bool ssh_client::download_sftp_file(
+    const QString &remote_path, const QString &local_path,
+    const std::function<void(quint64, quint64)> &progress)
+{
+	if (!sftp) {
+		error_message = "SFTP session is not initialized.";
+		return false;
+	}
+
+	const QByteArray remote_path_bytes = remote_path.toUtf8();
+	sftp_attributes attributes =
+	    sftp_stat(sftp, remote_path_bytes.constData());
+	if (!attributes) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+	const quint64 total = attributes->size;
+	sftp_attributes_free(attributes);
+
+	sftp_file remote_file =
+	    sftp_open(sftp, remote_path_bytes.constData(), O_RDONLY, 0);
+	if (!remote_file) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	QSaveFile local_file(local_path);
+	if (!local_file.open(QIODevice::WriteOnly)) {
+		error_message = local_file.errorString();
+		sftp_close(remote_file);
+		return false;
+	}
+
+	char buffer[64 * 1024];
+	quint64 transferred = 0;
+	quint64 last_reported = 0;
+	bool success = true;
+	while (true) {
+		const ssize_t received =
+		    sftp_read(remote_file, buffer, sizeof(buffer));
+		if (received < 0) {
+			error_message = QString::fromUtf8(ssh_get_error(session));
+			success = false;
+			break;
+		}
+		if (received == 0)
+			break;
+
+		qsizetype written = 0;
+		while (written < received) {
+			const qint64 count = local_file.write(
+			    buffer + written,
+			    static_cast<qint64>(received - written));
+			if (count <= 0) {
+				error_message = local_file.errorString();
+				success = false;
+				break;
+			}
+			written += count;
+		}
+		if (!success)
+			break;
+
+		transferred += static_cast<quint64>(received);
+		if (transferred - last_reported >= 1024 * 1024 ||
+		    transferred == total) {
+			progress(transferred, total);
+			last_reported = transferred;
+		}
+	}
+
+	if (sftp_close(remote_file) != SSH_OK && success) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		success = false;
+	}
+
+	if (success && !local_file.commit()) {
+		error_message = local_file.errorString();
+		success = false;
+	}
+	if (!success)
+		local_file.cancelWriting();
+
+	if (success)
+		error_message.clear();
+	return success;
+}
+
+bool ssh_client::upload_sftp_file(
+    const QString &local_path, const QString &remote_path,
+    const std::function<void(quint64, quint64)> &progress)
+{
+	if (!sftp) {
+		error_message = "SFTP session is not initialized.";
+		return false;
+	}
+
+	QFile local_file(local_path);
+	if (!local_file.open(QIODevice::ReadOnly)) {
+		error_message = local_file.errorString();
+		return false;
+	}
+
+	const QByteArray remote_path_bytes = remote_path.toUtf8();
+	sftp_file remote_file = sftp_open(
+	    sftp, remote_path_bytes.constData(), O_WRONLY | O_CREAT | O_EXCL,
+	    0600);
+	if (!remote_file) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		return false;
+	}
+
+	const quint64 total = static_cast<quint64>(local_file.size());
+	quint64 transferred = 0;
+	quint64 last_reported = 0;
+	char buffer[64 * 1024];
+	bool success = true;
+	while (true) {
+		const qint64 received = local_file.read(buffer, sizeof(buffer));
+		if (received < 0) {
+			error_message = local_file.errorString();
+			success = false;
+			break;
+		}
+		if (received == 0)
+			break;
+
+		qsizetype written = 0;
+		while (written < received) {
+			const ssize_t count = sftp_write(
+			    remote_file, buffer + written,
+			    static_cast<size_t>(received - written));
+			if (count <= 0) {
+				error_message =
+				    QString::fromUtf8(ssh_get_error(session));
+				success = false;
+				break;
+			}
+			written += count;
+		}
+		if (!success)
+			break;
+
+		transferred += static_cast<quint64>(received);
+		if (transferred - last_reported >= 1024 * 1024 ||
+		    transferred == total) {
+			progress(transferred, total);
+			last_reported = transferred;
+		}
+	}
+
+	if (sftp_close(remote_file) != SSH_OK && success) {
+		error_message = QString::fromUtf8(ssh_get_error(session));
+		success = false;
+	}
+
+	if (!success) {
+		const QString transfer_error = error_message;
+		if (sftp_unlink(sftp, remote_path_bytes.constData()) != SSH_OK) {
+			error_message =
+			    QString("%1\nFailed to remove the incomplete remote file: %2")
+				.arg(transfer_error,
+				     QString::fromUtf8(ssh_get_error(session)));
+		} else {
+			error_message = transfer_error;
+		}
+	}
+
+	if (success)
+		error_message.clear();
+	return success;
 }
 
 bool ssh_client::is_shell_open() const

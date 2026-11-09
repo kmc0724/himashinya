@@ -1,9 +1,13 @@
 #pragma once
 
 #include <libssh/libssh.h>
+#include <libssh/sftp.h>
 
 #include <QByteArray>
 #include <QString>
+#include <QVariantList>
+
+#include <functional>
 
 class ssh_client
 {
@@ -31,6 +35,16 @@ public:
 	bool resize_shell(int columns, int rows);
 	void close_shell();
 
+	bool initialize_sftp(QString &home_path);
+	bool list_sftp_directory(const QString &path, QString &canonical_path,
+				 QVariantList &entries);
+	bool download_sftp_file(const QString &remote_path,
+				const QString &local_path,
+				const std::function<void(quint64, quint64)> &progress);
+	bool upload_sftp_file(const QString &local_path,
+			      const QString &remote_path,
+			      const std::function<void(quint64, quint64)> &progress);
+
 	bool is_shell_open() const;
 	bool is_connected() const;
 	bool is_authenticated() const;
@@ -44,6 +58,7 @@ public:
 private:
 	ssh_session session = nullptr;
 	ssh_channel shell_channel = nullptr;
+	sftp_session sftp = nullptr;
 
 	bool authenticated = false;
 	QString error_message;

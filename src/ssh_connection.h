@@ -6,6 +6,7 @@
 #include <QByteArray>
 #include <QObject>
 #include <QThread>
+#include <QVariantList>
 
 class ssh_worker;
 
@@ -27,6 +28,11 @@ public:
 
 	void write_shell(const QByteArray &data);
 	void resize_shell(int columns, int rows);
+	void list_sftp_directory(quint64 request_id, const QString &path);
+	void download_sftp_file(quint64 request_id, const QString &remote_path,
+				const QString &local_path);
+	void upload_sftp_file(quint64 request_id, const QString &local_path,
+			      const QString &remote_path);
 
 	bool is_finished() const;
 
@@ -44,9 +50,24 @@ signals:
 
 	void shell_ready();
 	void shell_output(const QByteArray &data);
+	void sftp_ready(const QString &home_path, const QString &error);
+	void sftp_directory_list(quint64 request_id, const QString &path,
+				 const QVariantList &entries,
+				 const QString &error);
+	void sftp_transfer_progress(quint64 request_id, quint64 transferred,
+				    quint64 total);
+	void sftp_transfer_finished(quint64 request_id, bool success,
+				    const QString &error);
 
 	void shell_write_requested(const QByteArray &data);
 	void shell_resize_requested(int columns, int rows);
+	void sftp_list_requested(quint64 request_id, const QString &path);
+	void sftp_download_requested(quint64 request_id,
+				     const QString &remote_path,
+				     const QString &local_path);
+	void sftp_upload_requested(quint64 request_id,
+				   const QString &local_path,
+				   const QString &remote_path);
 
 private:
 	QThread thread;

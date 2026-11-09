@@ -71,6 +71,12 @@ void ssh_worker::authenticate(const QString &password)
 	shell_timer->start();
 
 	emit shell_ready();
+
+	QString home_path;
+	if (client.initialize_sftp(home_path))
+		emit sftp_ready(home_path, {});
+	else
+		emit sftp_ready({}, client.last_error());
 }
 
 void ssh_worker::write_shell(const QByteArray &data)
@@ -97,6 +103,57 @@ void ssh_worker::resize_shell(int columns, int rows)
 
 		disconnect();
 	}
+}
+
+void ssh_worker::list_sftp_directory(quint64 request_id,
+				     const QString &path)
+{
+	if (stopping)
+		return;
+
+	QString canonical_path;
+	QVariantList entries;
+	const bool success = client.list_sftp_directory(
+	    path, canonical_path, entries);
+	emit sftp_directory_list(
+	    request_id, canonical_path, entries,
+	    success ? QString() : client.last_error());
+}
+
+void ssh_worker::download_sftp_file(quint64 request_id,
+				    const QString &remote_path,
+				    const QString &local_path)
+{
+	if (stopping)
+		return;
+
+	const bool success = client.download_sftp_file(
+	    remote_path, local_path,
+	    [this, request_id](quint64 transferred, quint64 total) {
+		    emit sftp_transfer_progress(request_id, transferred,
+						total);
+	    });
+	emit sftp_transfer_finished(
+	    request_id, success,
+	    success ? QString() : client.last_error());
+}
+
+void ssh_worker::upload_sftp_file(quint64 request_id,
+				  const QString &local_path,
+				  const QString &remote_path)
+{
+	if (stopping)
+		return;
+
+	const bool success = client.upload_sftp_file(
+	    local_path, remote_path,
+	    [this, request_id](quint64 transferred, quint64 total) {
+		    emit sftp_transfer_progress(request_id, transferred,
+						total);
+	    });
+	emit sftp_transfer_finished(
+	    request_id, success,
+	    success ? QString() : client.last_error());
 }
 
 void ssh_worker::poll_shell()

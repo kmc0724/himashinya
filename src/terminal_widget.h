@@ -34,6 +34,7 @@ public:
 	~terminal_widget() override;
 
 	void feed_output(const QByteArray &data);
+	void set_terminal_font(const QFont &font);
 
 signals:
 	void send_data(const QByteArray &data);
@@ -89,6 +90,8 @@ private:
 	VTermState *state = nullptr;
 
 	QFont terminal_font;
+	QString ime_preedit;
+	bool ime_composing = false;
 
 	qreal cell_width = 0;
 	qreal cell_height = 0;

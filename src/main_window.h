@@ -3,6 +3,7 @@
 #include "server_profile.h"
 #include "server_repository.h"
 
+#include <QFont>
 #include <QList>
 #include <QMainWindow>
 #include <QPointer>
@@ -31,6 +32,9 @@ private:
 	void delete_server();
 
 	void close_terminal_tab(int index);
+	void setup_menu();
+	void show_terminal_font_dialog();
+	void apply_terminal_font(const QFont &font);
 
 	QTabWidget *sidebar_tabs = nullptr;
 	QTabWidget *terminal_tabs = nullptr;
@@ -38,4 +42,6 @@ private:
 
 	server_repository repository;
 	QList<server_profile> servers;
+
+	QFont terminal_font;
 };

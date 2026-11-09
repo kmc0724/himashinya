@@ -3,17 +3,214 @@
 
 #include <QClipboard>
 #include <QColor>
+#include <QDir>
+#include <QFile>
 #include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QHash>
 #include <QGuiApplication>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QLocale>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QResizeEvent>
+#include <QStringList>
 
 #include <algorithm>
+
+namespace {
+
+bool unicode_trace_enabled()
+{
+	return qEnvironmentVariableIsSet("HIMASHINYA_TRACE_UNICODE");
+}
+
+void write_unicode_trace(const QString &message)
+{
+	static bool first_write = true;
+	QFile file(QDir(QDir::tempPath())
+			   .filePath(QStringLiteral("himashinya-unicode-trace.log")));
+	QIODevice::OpenMode mode = QIODevice::WriteOnly;
+	mode |= first_write ? QIODevice::Truncate : QIODevice::Append;
+	if (!file.open(mode))
+		return;
+
+	file.write(message.toUtf8());
+	file.write("\r\n");
+	first_write = false;
+}
+
+QString codepoint_trace(const QString &text)
+{
+	QStringList codepoints;
+	for (uint codepoint : text.toUcs4())
+		codepoints.append(QStringLiteral("U+%1").arg(
+			codepoint, 4, 16, QLatin1Char('0')));
+	return codepoints.join(QLatin1Char(' '));
+}
+
+QFontDatabase::WritingSystem writing_system_for(const QString &text)
+{
+	for (uint codepoint : text.toUcs4()) {
+		const auto script =
+			QChar::script(static_cast<char32_t>(codepoint));
+		switch (script) {
+		case QChar::Script_Common:
+		case QChar::Script_Inherited:
+		case QChar::Script_Unknown:
+			continue;
+		case QChar::Script_Latin:
+			return QFontDatabase::Latin;
+		case QChar::Script_Greek:
+			return QFontDatabase::Greek;
+		case QChar::Script_Cyrillic:
+			return QFontDatabase::Cyrillic;
+		case QChar::Script_Armenian:
+			return QFontDatabase::Armenian;
+		case QChar::Script_Hebrew:
+			return QFontDatabase::Hebrew;
+		case QChar::Script_Arabic:
+			return QFontDatabase::Arabic;
+		case QChar::Script_Syriac:
+			return QFontDatabase::Syriac;
+		case QChar::Script_Thaana:
+			return QFontDatabase::Thaana;
+		case QChar::Script_Devanagari:
+			return QFontDatabase::Devanagari;
+		case QChar::Script_Bengali:
+			return QFontDatabase::Bengali;
+		case QChar::Script_Gurmukhi:
+			return QFontDatabase::Gurmukhi;
+		case QChar::Script_Gujarati:
+			return QFontDatabase::Gujarati;
+		case QChar::Script_Oriya:
+			return QFontDatabase::Oriya;
+		case QChar::Script_Tamil:
+			return QFontDatabase::Tamil;
+		case QChar::Script_Telugu:
+			return QFontDatabase::Telugu;
+		case QChar::Script_Kannada:
+			return QFontDatabase::Kannada;
+		case QChar::Script_Malayalam:
+			return QFontDatabase::Malayalam;
+		case QChar::Script_Sinhala:
+			return QFontDatabase::Sinhala;
+		case QChar::Script_Thai:
+			return QFontDatabase::Thai;
+		case QChar::Script_Lao:
+			return QFontDatabase::Lao;
+		case QChar::Script_Tibetan:
+			return QFontDatabase::Tibetan;
+		case QChar::Script_Myanmar:
+			return QFontDatabase::Myanmar;
+		case QChar::Script_Georgian:
+			return QFontDatabase::Georgian;
+		case QChar::Script_Hangul:
+			return QFontDatabase::Korean;
+		case QChar::Script_Khmer:
+			return QFontDatabase::Khmer;
+		case QChar::Script_Hiragana:
+		case QChar::Script_Katakana:
+			return QFontDatabase::Japanese;
+		case QChar::Script_Bopomofo:
+			return QFontDatabase::TraditionalChinese;
+		case QChar::Script_Han:
+			switch (QLocale().language()) {
+			case QLocale::Japanese:
+				return QFontDatabase::Japanese;
+			case QLocale::Korean:
+				return QFontDatabase::Korean;
+			case QLocale::Chinese:
+				return QLocale().territory() == QLocale::Taiwan ||
+					       QLocale().territory() ==
+						   QLocale::HongKong ||
+					       QLocale().territory() ==
+						   QLocale::Macao
+					   ? QFontDatabase::TraditionalChinese
+					   : QFontDatabase::SimplifiedChinese;
+			default:
+				continue;
+			}
+		case QChar::Script_Nko:
+			return QFontDatabase::Nko;
+		default:
+			return QFontDatabase::Other;
+		}
+	}
+
+	return QFontDatabase::Any;
+}
+
+QString fallback_font_family(QFontDatabase::WritingSystem writing_system)
+{
+	static QHash<int, QString> family_cache;
+	const int key = static_cast<int>(writing_system);
+	const auto cached = family_cache.constFind(key);
+	if (cached != family_cache.cend())
+		return cached.value();
+
+	const QStringList families = QFontDatabase::families(writing_system);
+	QStringList preferred;
+	switch (writing_system) {
+	case QFontDatabase::Japanese:
+		preferred = {QStringLiteral("Yu Gothic"),
+			     QStringLiteral("Meiryo")};
+		break;
+	case QFontDatabase::Korean:
+		preferred = {QStringLiteral("Malgun Gothic"),
+			     QStringLiteral("Noto Sans KR")};
+		break;
+	case QFontDatabase::SimplifiedChinese:
+		preferred = {QStringLiteral("Microsoft YaHei"),
+			     QStringLiteral("Noto Sans SC")};
+		break;
+	case QFontDatabase::TraditionalChinese:
+		preferred = {QStringLiteral("Microsoft JhengHei"),
+			     QStringLiteral("Noto Sans TC")};
+		break;
+	default:
+		break;
+	}
+
+	QString family;
+	for (const QString &name : preferred) {
+		for (const QString &candidate : families) {
+			if (candidate.compare(name, Qt::CaseInsensitive) == 0) {
+				family = candidate;
+				break;
+			}
+		}
+		if (!family.isEmpty())
+			break;
+	}
+
+	if (family.isEmpty() && !families.isEmpty())
+		family = families.first();
+
+	family_cache.insert(key, family);
+	return family;
+}
+
+QFont cell_font(const QFont &terminal_font, const QString &text)
+{
+	QFont font = terminal_font;
+	const auto writing_system = writing_system_for(text);
+	if (writing_system != QFontDatabase::Any &&
+	    writing_system != QFontDatabase::Latin) {
+		const QString family = fallback_font_family(writing_system);
+		if (!family.isEmpty()) {
+			font.setFamily(family);
+			font.setStyleHint(QFont::SansSerif);
+			font.setFixedPitch(false);
+		}
+	}
+
+	return font;
+}
+
+} // namespace
 
 terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 {
@@ -104,6 +301,15 @@ int terminal_widget::cursor_callback(VTermPos pos, VTermPos, int visible,
 void terminal_widget::output_callback(const char *data, size_t len, void *user)
 {
 	auto *self = static_cast<terminal_widget *>(user);
+	if (unicode_trace_enabled()) {
+		const QByteArray bytes(data, static_cast<qsizetype>(len));
+		if (std::any_of(bytes.cbegin(), bytes.cend(), [](char byte) {
+			    return static_cast<unsigned char>(byte) >= 0x80;
+		    }))
+			write_unicode_trace(QStringLiteral("terminal tx hex: %1")
+						     .arg(QString::fromLatin1(
+							     bytes.toHex(' '))));
+	}
 
 	emit self->send_data(QByteArray(data, static_cast<qsizetype>(len)));
 }
@@ -112,6 +318,12 @@ void terminal_widget::feed_output(const QByteArray &data)
 {
 	if (!vterm || data.isEmpty())
 		return;
+	if (unicode_trace_enabled() &&
+	    std::any_of(data.cbegin(), data.cend(), [](char byte) {
+		    return static_cast<unsigned char>(byte) >= 0x80;
+	    }))
+		write_unicode_trace(QStringLiteral("ssh rx hex: %1")
+					    .arg(QString::fromLatin1(data.toHex(' '))));
 
 	vterm_input_write(vterm, data.constData(),
 			  static_cast<size_t>(data.size()));
@@ -128,6 +340,12 @@ QColor terminal_widget::cell_color(VTermColor color) const
 
 QString terminal_widget::cell_text(const VTermScreenCell &cell) const
 {
+	/* libvterm marks the second column of a wide glyph with UINT32_MAX.
+	 * It is a layout sentinel, not a Unicode codepoint to render or copy.
+	 */
+	if (cell.chars[0] == UINT32_MAX)
+		return {};
+
 	int count = 0;
 
 	while (count < VTERM_MAX_CHARS_PER_CELL && cell.chars[count] != 0)
@@ -146,6 +364,8 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 	if (cell.width == 0)
 		return;
 
+	const bool wide_char_continuation = cell.chars[0] == UINT32_MAX;
+
 	QColor fg = cell_color(cell.fg);
 	QColor bg = cell_color(cell.bg);
 
@@ -159,12 +379,13 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 		    cell_width * std::max(1, static_cast<int>(cell.width)),
 		    cell_height);
 
-	painter.fillRect(rect, bg);
+	if (!wide_char_continuation)
+		painter.fillRect(rect, bg);
 
-	QString text = cell_text(cell);
+	QString text = wide_char_continuation ? QString() : cell_text(cell);
 
 	if (!text.trimmed().isEmpty()) {
-		QFont font = terminal_font;
+		QFont font = cell_font(terminal_font, text);
 		font.setBold(cell.attrs.bold);
 		font.setItalic(cell.attrs.italic);
 		font.setUnderline(cell.attrs.underline != 0);
@@ -173,7 +394,21 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 		painter.setFont(font);
 		painter.setPen(fg);
 
-		painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter, text);
+		if (cell.width > 1) {
+			const QFontMetricsF metrics(font);
+			const qreal text_width = metrics.horizontalAdvance(text);
+			const qreal text_x = rect.x() +
+					     std::max<qreal>(
+						 0, (rect.width() - text_width) /
+							    2);
+			const qreal baseline =
+				rect.y() + (rect.height() - metrics.height()) / 2 +
+				metrics.ascent();
+			painter.drawText(QPointF(text_x, baseline), text);
+		} else {
+			painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter,
+					 text);
+		}
 	}
 
 	if (has_selection) {
@@ -245,12 +480,45 @@ void terminal_widget::paintEvent(QPaintEvent *)
 		painter.setPen(QColor("#d4d4d4"));
 		painter.drawRect(cursor);
 	}
+
+	if (scroll_offset == 0 && !ime_preedit.isEmpty()) {
+		const int col = std::clamp(cursor_position.col, 0, columns - 1);
+		const int row = std::clamp(cursor_position.row, 0, rows - 1);
+		const qreal x = col * cell_width;
+		const qreal y = row * cell_height;
+		QRectF preedit_rect(x, y,
+				    std::max<qreal>(cell_width, width() - x),
+				    cell_height);
+
+		painter.fillRect(preedit_rect, QColor(55, 55, 55, 220));
+		painter.setFont(cell_font(terminal_font, ime_preedit));
+		painter.setPen(QColor("#ffffff"));
+		painter.drawText(preedit_rect,
+				 Qt::AlignLeft | Qt::AlignVCenter,
+				 ime_preedit);
+		painter.drawLine(preedit_rect.bottomLeft(),
+				 preedit_rect.bottomRight());
+	}
 }
 
 void terminal_widget::resizeEvent(QResizeEvent *event)
 {
 	QWidget::resizeEvent(event);
 	update_terminal_size();
+}
+
+void terminal_widget::set_terminal_font(const QFont &font)
+{
+	terminal_font = font;
+	terminal_font.setStyleHint(QFont::Monospace);
+	terminal_font.setFixedPitch(true);
+
+	QFontMetricsF metrics(terminal_font);
+	cell_width = metrics.horizontalAdvance(QLatin1Char('M'));
+	cell_height = metrics.height();
+
+	update_terminal_size();
+	update();
 }
 
 void terminal_widget::update_terminal_size()
@@ -402,8 +670,26 @@ void terminal_widget::keyPressEvent(QKeyEvent *event)
 		vterm_keyboard_unichar(vterm, 'a' + key - Qt::Key_A, mod);
 	} else {
 		const QString text = event->text();
+		if (unicode_trace_enabled() && !text.isEmpty())
+			write_unicode_trace(QStringLiteral("key text codepoints: %1")
+					     .arg(codepoint_trace(text)));
+		if (ime_composing && !text.isEmpty()) {
+			event->accept();
+			return;
+		}
 
-		for (uint codepoint : text.toUcs4())
+		/* Non-ASCII text from an input method must arrive through
+		 * inputMethodEvent() as committed text. Forwarding key-event text
+		 * here can leak intermediate IME composition into the remote shell.
+		 */
+		const auto codepoints = text.toUcs4();
+		if (std::any_of(codepoints.cbegin(), codepoints.cend(),
+				[](uint codepoint) { return codepoint > 0x7f; })) {
+			event->accept();
+			return;
+		}
+
+		for (uint codepoint : codepoints)
 			vterm_keyboard_unichar(vterm, codepoint, mod);
 	}
 
@@ -412,6 +698,15 @@ void terminal_widget::keyPressEvent(QKeyEvent *event)
 
 void terminal_widget::inputMethodEvent(QInputMethodEvent *event)
 {
+	if (unicode_trace_enabled()) {
+		write_unicode_trace(
+			QStringLiteral("IME preedit: %1 | commit: %2")
+				.arg(codepoint_trace(event->preeditString()),
+				     codepoint_trace(event->commitString())));
+	}
+	ime_preedit = event->preeditString();
+	ime_composing = !ime_preedit.isEmpty();
+
 	const QString text = event->commitString();
 
 	if (vterm && !text.isEmpty()) {
@@ -421,6 +716,9 @@ void terminal_widget::inputMethodEvent(QInputMethodEvent *event)
 		}
 	}
 
+	if (QGuiApplication::inputMethod())
+		QGuiApplication::inputMethod()->update(Qt::ImCursorRectangle);
+	update();
 	event->accept();
 }
 
@@ -428,6 +726,12 @@ QVariant terminal_widget::inputMethodQuery(Qt::InputMethodQuery query) const
 {
 	if (query == Qt::ImEnabled)
 		return true;
+	if (query == Qt::ImCursorRectangle) {
+		const int col = std::clamp(cursor_position.col, 0, columns - 1);
+		const int row = std::clamp(cursor_position.row, 0, rows - 1);
+		return QRectF(col * cell_width, row * cell_height, cell_width,
+			      cell_height);
+	}
 
 	return QWidget::inputMethodQuery(query);
 }
@@ -470,8 +774,10 @@ int terminal_widget::scrollback_popline(int cols, VTermScreenCell *cells,
 
 	std::copy_n(line.cells.constBegin(), count, cells);
 
-	for (int i = count; i < cols; ++i)
+	for (int i = count; i < cols; ++i) {
 		cells[i] = {};
+		cells[i].width = 1;
+	}
 
 	self->scroll_offset = std::min(self->scroll_offset,
 				       static_cast<int>(self->history.size()));

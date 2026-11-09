@@ -6,14 +6,18 @@
 #include <QAction>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFontDatabase>
+#include <QFontDialog>
 #include <QFormLayout>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSettings>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QTabWidget>
@@ -27,7 +31,20 @@ main_window::main_window(QWidget *parent) : QMainWindow(parent)
 {
 	servers = repository.load();
 
+	terminal_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+	terminal_font.setPointSize(11);
+	terminal_font.setStyleHint(QFont::Monospace);
+	terminal_font.setFixedPitch(true);
+
+	QSettings settings("Himashinya", "Himashinya");
+	terminal_font.setFamily(settings.value("terminal/font_family",
+					      terminal_font.family())
+					.toString());
+	terminal_font.setPointSize(
+		qBound(6, settings.value("terminal/font_size", 11).toInt(), 72));
+
 	setup_ui();
+	setup_menu();
 	setup_style();
 	refresh_servers();
 }
@@ -200,6 +217,54 @@ void main_window::setup_style()
 	)");
 }
 
+void main_window::setup_menu()
+{
+	QMenu *settings_menu = menuBar()->addMenu("Settings");
+	QAction *font_action = settings_menu->addAction("Terminal Font...");
+
+	connect(font_action, &QAction::triggered, this,
+		&main_window::show_terminal_font_dialog);
+}
+
+void main_window::show_terminal_font_dialog()
+{
+	QFontDialog dialog(terminal_font, this);
+	dialog.setWindowTitle("Terminal Font");
+	dialog.setOption(QFontDialog::DontUseNativeDialog);
+	dialog.setOption(QFontDialog::MonospacedFonts);
+
+	if (dialog.exec() != QDialog::Accepted)
+		return;
+
+	apply_terminal_font(dialog.selectedFont());
+}
+
+void main_window::apply_terminal_font(const QFont &font)
+{
+	QFont selected_font = font;
+	selected_font.setStyleHint(QFont::Monospace);
+	selected_font.setFixedPitch(true);
+
+	selected_font.setPointSize(
+		qBound(6, selected_font.pointSize() > 0
+				 ? selected_font.pointSize()
+				 : 11,
+		       72));
+
+	terminal_font = selected_font;
+
+	QSettings settings("Himashinya", "Himashinya");
+	settings.setValue("terminal/font_family", terminal_font.family());
+	settings.setValue("terminal/font_size", terminal_font.pointSize());
+
+	for (int index = 0; index < terminal_tabs->count(); ++index) {
+		auto *terminal =
+			qobject_cast<terminal_widget *>(terminal_tabs->widget(index));
+		if (terminal)
+			terminal->set_terminal_font(terminal_font);
+	}
+}
+
 static bool edit_profile_dialog(QWidget *parent, server_profile &server)
 {
 	QDialog dialog(parent);
@@ -363,6 +428,7 @@ void main_window::connect_server()
 	connect(connection, &ssh_connection::authenticated, this,
 		[this, connection, server]() {
 			auto *terminal = new terminal_widget;
+			terminal->set_terminal_font(terminal_font);
 
 			terminal->setProperty(
 			    "ssh_connection",

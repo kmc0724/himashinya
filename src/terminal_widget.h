@@ -60,6 +60,7 @@ private:
 	static void output_callback(const char *data, size_t len, void *user);
 
 	void update_terminal_size();
+	void rebuild_history_view();
 	void ensure_terminal_buffer();
 	void mark_terminal_dirty(const QRect &area);
 	void flush_terminal_updates();
@@ -72,10 +73,7 @@ private:
 		       const VTermScreenCell &cell, bool draw_background);
 
 	static int scrollback_pushline(int cols, const VTermScreenCell *cells,
-				       void *user);
-
-	static int scrollback_popline(int cols, VTermScreenCell *cells,
-				      void *user);
+				       bool continuation, void *user);
 
 	void wheelEvent(QWheelEvent *event) override;
 
@@ -140,9 +138,14 @@ private:
 
 	struct history_line {
 		QVector<VTermScreenCell> cells;
+		bool continuation = false;
+		quint64 source_offset = 0;
 	};
 
 	QVector<history_line> history;
+	QVector<history_line> history_view;
+	bool history_view_dirty = false;
+	quint64 next_history_source_offset = 0;
 
 	int scroll_offset = 0;
 

@@ -311,11 +311,12 @@ terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 	static const VTermScreenCallbacks callbacks = {
 	    .damage = &terminal_widget::damage_callback,
 	    .movecursor = &terminal_widget::cursor_callback,
-	    .sb_pushline = &terminal_widget::scrollback_pushline,
-	    .sb_popline = &terminal_widget::scrollback_popline,
+	    .sb_pushline4 = &terminal_widget::scrollback_pushline,
 	};
 
 	vterm_screen_set_callbacks(screen, &callbacks, this);
+	vterm_screen_callbacks_has_pushline4(screen);
+	vterm_screen_set_reflow(screen, 1);
 
 	vterm_output_set_callback(vterm, &terminal_widget::output_callback,
 				  this);
@@ -405,6 +406,18 @@ void terminal_widget::feed_output(const QByteArray &data)
 			  static_cast<size_t>(data.size()));
 
 	vterm_screen_flush_damage(screen);
+	if (history_view_dirty) {
+		const int old_view_size = history_view.size();
+		rebuild_history_view();
+		if (scroll_offset > 0) {
+			scroll_offset = std::clamp(
+			    scroll_offset +
+				static_cast<int>(history_view.size()) -
+				old_view_size,
+			    0, static_cast<int>(history_view.size()));
+		}
+		invalidate_terminal_buffer();
+	}
 }
 
 QColor terminal_widget::cell_color(VTermColor color) const
@@ -589,16 +602,17 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 
 	for (int row = first_row; row <= last_row; ++row) {
 		const int logical_row =
-		    static_cast<int>(history.size()) - scroll_offset + row;
+		    static_cast<int>(history_view.size()) - scroll_offset + row;
 
 		for (int col = first_col; col <= last_col; ++col) {
 			const int index = col - first_col;
 			VTermScreenCell cell = {};
 			bool valid = false;
 
-			if (logical_row < static_cast<int>(history.size())) {
+			if (logical_row < static_cast<int>(history_view.size())) {
 				if (logical_row >= 0) {
-					const auto &line = history[logical_row].cells;
+					const auto &line =
+					    history_view[logical_row].cells;
 					if (col < line.size()) {
 						cell = line[col];
 						valid = true;
@@ -607,7 +621,7 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 			} else {
 				const int screen_row =
 				    logical_row -
-				    static_cast<int>(history.size());
+				    static_cast<int>(history_view.size());
 				const VTermPos pos = {screen_row, col};
 				valid = vterm_screen_get_cell(screen, pos, &cell);
 			}
@@ -682,7 +696,7 @@ void terminal_widget::draw_selection_overlay(QPainter &painter,
 
 	for (int row = first_row; row <= last_row; ++row) {
 		const int logical_row =
-		    static_cast<int>(history.size()) - scroll_offset + row;
+		    static_cast<int>(history_view.size()) - scroll_offset + row;
 		if (logical_row < start.y() || logical_row > end.y())
 			continue;
 
@@ -876,10 +890,41 @@ void terminal_widget::update_terminal_size()
 		return;
 	}
 
+	if (history_view_dirty)
+		rebuild_history_view();
+	const int old_top_row =
+	    static_cast<int>(history_view.size()) - scroll_offset;
+	const bool preserve_history_position =
+	    scroll_offset > 0 && old_top_row >= 0 &&
+	    old_top_row < history_view.size();
+	const quint64 scroll_anchor =
+	    preserve_history_position
+		? history_view[old_top_row].source_offset
+		: 0;
+	auto restore_history_position = [this, preserve_history_position,
+					 scroll_anchor]() {
+		if (!preserve_history_position || history_view.isEmpty())
+			return;
+
+		int anchor_row = 0;
+		for (int i = 1; i < history_view.size(); ++i) {
+			if (history_view[i].source_offset > scroll_anchor)
+				break;
+			anchor_row = i;
+		}
+		scroll_offset =
+		static_cast<int>(history_view.size()) - anchor_row;
+	};
 	columns = new_columns;
 	rows = new_rows;
+	rebuild_history_view();
+	restore_history_position();
 
 	vterm_set_size(vterm, rows, columns);
+	if (history_view_dirty) {
+		rebuild_history_view();
+		restore_history_position();
+	}
 
 	emit resize_requested(columns, rows);
 	invalidate_terminal_buffer();
@@ -1109,54 +1154,137 @@ QVariant terminal_widget::inputMethodQuery(Qt::InputMethodQuery query) const
 }
 
 int terminal_widget::scrollback_pushline(int cols, const VTermScreenCell *cells,
-					 void *user)
+					 bool continuation, void *user)
 {
 	auto *self = static_cast<terminal_widget *>(user);
-
 	history_line line;
 	line.cells.resize(cols);
+	line.continuation = continuation;
+	line.source_offset = self->next_history_source_offset;
+	self->next_history_source_offset += static_cast<quint64>(cols);
 
 	std::copy_n(cells, cols, line.cells.begin());
 
 	self->history.append(std::move(line));
 
-	if (self->history.size() > max_history_lines)
+	if (self->history.size() > max_history_lines) {
 		self->history.removeFirst();
-
-	if (self->scroll_offset > 0) {
-		self->scroll_offset =
-		    std::min(self->scroll_offset + 1,
-			     static_cast<int>(self->history.size()));
+		if (!self->history.isEmpty())
+			self->history[0].continuation = false;
 	}
-	self->invalidate_terminal_buffer();
+	self->history_view_dirty = true;
 
 	return 1;
 }
 
-int terminal_widget::scrollback_popline(int cols, VTermScreenCell *cells,
-					void *user)
+void terminal_widget::rebuild_history_view()
 {
-	auto *self = static_cast<terminal_widget *>(user);
+	history_view.clear();
+	history_view_dirty = false;
+	if (columns <= 0 || history.isEmpty())
+		return;
 
-	if (self->history.isEmpty())
-		return 0;
+	QVector<VTermScreenCell> paragraph;
+	QVector<quint64> paragraph_source_offsets;
+	quint64 paragraph_start_offset = 0;
+	auto add_blank_line = [this]() {
+		history_line line;
+		line.cells.resize(columns);
+		for (VTermScreenCell &cell : line.cells) {
+			cell = {};
+			cell.width = 1;
+		}
+		history_view.append(std::move(line));
+	};
+	auto emit_paragraph =
+	    [this, &paragraph, &paragraph_source_offsets,
+	     &paragraph_start_offset, &add_blank_line]() {
+		if (paragraph.isEmpty()) {
+			add_blank_line();
+			history_view.last().source_offset = paragraph_start_offset;
+			return;
+		}
 
-	history_line line = self->history.takeLast();
+		int source_col = 0;
+		while (source_col < paragraph.size()) {
+			history_line line;
+			line.source_offset =
+			    paragraph_source_offsets[source_col];
+			line.cells.resize(columns);
+			for (VTermScreenCell &cell : line.cells) {
+				cell = {};
+				cell.width = 1;
+			}
 
-	int count = std::min(cols, static_cast<int>(line.cells.size()));
+			int dest_col = 0;
+			while (source_col < paragraph.size() &&
+			       dest_col < columns) {
+				const VTermScreenCell &cell =
+				    paragraph[source_col];
+				if (cell.width == 0) {
+					++source_col;
+					continue;
+				}
+				if (cell.width == 2 && dest_col == columns - 1) {
+					if (columns > 1)
+						break;
+					line.cells[dest_col] = cell;
+					line.cells[dest_col].width = 1;
+					++source_col;
+					if (source_col < paragraph.size() &&
+					    paragraph[source_col].width == 0)
+						++source_col;
+					++dest_col;
+					continue;
+				}
 
-	std::copy_n(line.cells.constBegin(), count, cells);
+				line.cells[dest_col] = cell;
+				++source_col;
+				++dest_col;
+				if (cell.width == 2 &&
+				    source_col < paragraph.size()) {
+					if (dest_col < columns) {
+						line.cells[dest_col] =
+						    paragraph[source_col];
+						++dest_col;
+					}
+					if (paragraph[source_col].width == 0)
+						++source_col;
+				}
+			}
 
-	for (int i = count; i < cols; ++i) {
-		cells[i] = {};
-		cells[i].width = 1;
+			line.continuation = source_col < paragraph.size();
+			history_view.append(std::move(line));
+		}
+		paragraph.clear();
+		paragraph_source_offsets.clear();
+	};
+
+	for (int i = 0; i < history.size(); ++i) {
+		const history_line &line = history[i];
+		if (!line.continuation && !paragraph.isEmpty())
+			emit_paragraph();
+		if (paragraph.isEmpty())
+			paragraph_start_offset = line.source_offset;
+
+		const bool continues =
+		    i + 1 < history.size() && history[i + 1].continuation;
+		int end = line.cells.size();
+		if (!continues) {
+			while (end > 0 && line.cells[end - 1].chars[0] == 0)
+				--end;
+		}
+		for (int col = 0; col < end; ++col) {
+			paragraph.append(line.cells[col]);
+			paragraph_source_offsets.append(line.source_offset + col);
+		}
+
+		if (!continues)
+			emit_paragraph();
 	}
 
-	self->scroll_offset = std::min(self->scroll_offset,
-				       static_cast<int>(self->history.size()));
-	self->invalidate_terminal_buffer();
-
-	return 1;
+	if (!paragraph.isEmpty())
+		emit_paragraph();
 }
 
 void terminal_widget::wheelEvent(QWheelEvent *event)
@@ -1175,7 +1303,7 @@ void terminal_widget::wheelEvent(QWheelEvent *event)
 void terminal_widget::scroll_history(int lines)
 {
 	scroll_offset = std::clamp(scroll_offset + lines, 0,
-				   static_cast<int>(history.size()));
+				   static_cast<int>(history_view.size()));
 	invalidate_terminal_buffer();
 
 	update();
@@ -1190,7 +1318,7 @@ QPoint terminal_widget::mouse_to_cell(const QPoint &position) const
 			     rows - 1);
 
 	int logical_row =
-	    static_cast<int>(history.size()) - scroll_offset + row;
+	    static_cast<int>(history_view.size()) - scroll_offset + row;
 
 	return QPoint(col, logical_row);
 }
@@ -1277,8 +1405,8 @@ QString terminal_widget::selected_text() const
 		for (int col = first_col; col <= last_col; ++col) {
 			VTermScreenCell cell = {};
 
-			if (row < history.size()) {
-				const auto &cells = history[row].cells;
+			if (row < history_view.size()) {
+				const auto &cells = history_view[row].cells;
 
 				if (col >= cells.size())
 					continue;
@@ -1286,7 +1414,7 @@ QString terminal_widget::selected_text() const
 				cell = cells[col];
 			} else {
 				VTermPos pos = {
-				    row - static_cast<int>(history.size()),
+				    row - static_cast<int>(history_view.size()),
 				    col};
 
 				if (!vterm_screen_get_cell(screen, pos, &cell))
@@ -1415,7 +1543,7 @@ void terminal_widget::update_selection_area(const QPoint &first,
 	}
 
 	const int first_visible_row =
-	    static_cast<int>(history.size()) - scroll_offset;
+	    static_cast<int>(history_view.size()) - scroll_offset;
 	const int screen_top = std::max(top_row, first_visible_row);
 	const int screen_bottom =
 	    std::min(bottom_row, first_visible_row + rows - 1);

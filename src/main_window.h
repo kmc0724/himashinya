@@ -18,7 +18,7 @@ class main_window : public QMainWindow
 {
 public:
 	explicit main_window(QWidget *parent = nullptr);
-	~main_window() override = default;
+	~main_window() override;
 
 	void connect_server();
 

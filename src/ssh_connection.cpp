@@ -59,11 +59,15 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 
 ssh_connection::~ssh_connection()
 {
+	shutdown();
+}
+
+void ssh_connection::shutdown()
+{
 	if (!started)
 		return;
 
 	close();
-
 	if (thread.isRunning())
 		thread.wait();
 }

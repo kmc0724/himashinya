@@ -49,6 +49,13 @@ main_window::main_window(QWidget *parent) : QMainWindow(parent)
 	refresh_servers();
 }
 
+main_window::~main_window()
+{
+	const auto connections = findChildren<ssh_connection *>();
+	for (auto *connection : connections)
+		connection->shutdown();
+}
+
 void main_window::setup_ui()
 {
 	setWindowTitle("Himashinya");

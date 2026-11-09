@@ -20,6 +20,7 @@ public:
 
 	void start();
 	void close();
+	void shutdown();
 
 	void trust_host_key();
 	void authenticate(const QString &password);

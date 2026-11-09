@@ -512,7 +512,6 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 					 text);
 		}
 	}
-
 }
 
 void terminal_widget::ensure_terminal_buffer()
@@ -523,8 +522,8 @@ void terminal_widget::ensure_terminal_buffer()
 	if (terminal_buffer.size() == buffer_size)
 		return;
 
-	terminal_buffer = QImage(buffer_size,
-				 QImage::Format_ARGB32_Premultiplied);
+	terminal_buffer =
+	    QImage(buffer_size, QImage::Format_ARGB32_Premultiplied);
 	if (terminal_buffer.isNull())
 		return;
 
@@ -592,8 +591,9 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 	    static_cast<int>(clipped_area.bottom() / cell_height), 0, rows - 1);
 	const int first_col = std::clamp(
 	    static_cast<int>(clipped_area.left() / cell_width), 0, columns - 1);
-	const int last_col = std::clamp(
-	    static_cast<int>(clipped_area.right() / cell_width), 0, columns - 1);
+	const int last_col =
+	    std::clamp(static_cast<int>(clipped_area.right() / cell_width), 0,
+		       columns - 1);
 	quint64 cells_drawn = 0;
 	const int row_cell_count = last_col - first_col + 1;
 	QVector<VTermScreenCell> row_cells(row_cell_count);
@@ -609,7 +609,8 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 			VTermScreenCell cell = {};
 			bool valid = false;
 
-			if (logical_row < static_cast<int>(history_view.size())) {
+			if (logical_row <
+			    static_cast<int>(history_view.size())) {
 				if (logical_row >= 0) {
 					const auto &line =
 					    history_view[logical_row].cells;
@@ -623,7 +624,8 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 				    logical_row -
 				    static_cast<int>(history_view.size());
 				const VTermPos pos = {screen_row, col};
-				valid = vterm_screen_get_cell(screen, pos, &cell);
+				valid =
+				    vterm_screen_get_cell(screen, pos, &cell);
 			}
 
 			row_cells[index] = cell;
@@ -661,8 +663,7 @@ quint64 terminal_widget::render_terminal_region(const QRect &area)
 			const int index = col - first_col;
 			const VTermScreenCell &cell = row_cells[index];
 			if (!row_cell_valid[index] || cell.width == 0 ||
-			    cell.chars[0] == 0 ||
-			    cell.chars[0] == UINT32_MAX)
+			    cell.chars[0] == 0 || cell.chars[0] == UINT32_MAX)
 				continue;
 
 			draw_cell(painter, row, col, cell, false);
@@ -685,8 +686,8 @@ void terminal_widget::draw_selection_overlay(QPainter &painter,
 	    (start.y() == end.y() && start.x() > end.x()))
 		std::swap(start, end);
 
-	const int first_row = std::clamp(
-	    static_cast<int>(area.top() / cell_height), 0, rows - 1);
+	const int first_row =
+	    std::clamp(static_cast<int>(area.top() / cell_height), 0, rows - 1);
 	const int last_row = std::clamp(
 	    static_cast<int>(area.bottom() / cell_height), 0, rows - 1);
 	const int first_col = std::clamp(
@@ -700,20 +701,18 @@ void terminal_widget::draw_selection_overlay(QPainter &painter,
 		if (logical_row < start.y() || logical_row > end.y())
 			continue;
 
-		const int left_col =
-		    std::max(first_col,
-			     logical_row == start.y() ? start.x() : 0);
-		const int right_col =
-		    std::min(last_col, logical_row == end.y() ? end.x()
-								: columns - 1);
+		const int left_col = std::max(
+		    first_col, logical_row == start.y() ? start.x() : 0);
+		const int right_col = std::min(
+		    last_col, logical_row == end.y() ? end.x() : columns - 1);
 		if (left_col > right_col)
 			continue;
 
-		painter.fillRect(
-		    QRectF(left_col * cell_width, row * cell_height,
-			   (right_col - left_col + 1) * cell_width,
-			   cell_height),
-		    QColor(80, 140, 220, 100));
+		painter.fillRect(QRectF(left_col * cell_width,
+					row * cell_height,
+					(right_col - left_col + 1) * cell_width,
+					cell_height),
+				 QColor(80, 140, 220, 100));
 	}
 }
 
@@ -736,7 +735,8 @@ void terminal_widget::paintEvent(QPaintEvent *event)
 	const QRect visible_buffer =
 	    dirty_rect.intersected(terminal_buffer.rect());
 	if (!visible_buffer.isEmpty())
-		painter.drawImage(visible_buffer, terminal_buffer, visible_buffer);
+		painter.drawImage(visible_buffer, terminal_buffer,
+				  visible_buffer);
 
 	draw_selection_overlay(painter, dirty_rect);
 
@@ -827,8 +827,7 @@ void terminal_widget::report_render_metrics()
 			   "loop_ticks=%7 late_loop_ticks=%8 "
 			   "max_loop_gap_ms=%9\n")
 		.arg(render_paint_count / interval_seconds, 0, 'f', 1)
-		.arg(render_buffer_update_count / interval_seconds, 0, 'f',
-		     1)
+		.arg(render_buffer_update_count / interval_seconds, 0, 'f', 1)
 		.arg(average_paint_ms, 0, 'f', 3)
 		.arg(render_paint_max_ns / 1'000'000.0, 0, 'f', 3)
 		.arg(qRound64(render_cell_count / interval_seconds))
@@ -898,9 +897,8 @@ void terminal_widget::update_terminal_size()
 	    scroll_offset > 0 && old_top_row >= 0 &&
 	    old_top_row < history_view.size();
 	const quint64 scroll_anchor =
-	    preserve_history_position
-		? history_view[old_top_row].source_offset
-		: 0;
+	    preserve_history_position ? history_view[old_top_row].source_offset
+				      : 0;
 	auto restore_history_position = [this, preserve_history_position,
 					 scroll_anchor]() {
 		if (!preserve_history_position || history_view.isEmpty())
@@ -913,7 +911,7 @@ void terminal_widget::update_terminal_size()
 			anchor_row = i;
 		}
 		scroll_offset =
-		static_cast<int>(history_view.size()) - anchor_row;
+		    static_cast<int>(history_view.size()) - anchor_row;
 	};
 	columns = new_columns;
 	rows = new_rows;
@@ -1196,12 +1194,12 @@ void terminal_widget::rebuild_history_view()
 		}
 		history_view.append(std::move(line));
 	};
-	auto emit_paragraph =
-	    [this, &paragraph, &paragraph_source_offsets,
-	     &paragraph_start_offset, &add_blank_line]() {
+	auto emit_paragraph = [this, &paragraph, &paragraph_source_offsets,
+			       &paragraph_start_offset, &add_blank_line]() {
 		if (paragraph.isEmpty()) {
 			add_blank_line();
-			history_view.last().source_offset = paragraph_start_offset;
+			history_view.last().source_offset =
+			    paragraph_start_offset;
 			return;
 		}
 
@@ -1225,7 +1223,8 @@ void terminal_widget::rebuild_history_view()
 					++source_col;
 					continue;
 				}
-				if (cell.width == 2 && dest_col == columns - 1) {
+				if (cell.width == 2 &&
+				    dest_col == columns - 1) {
 					if (columns > 1)
 						break;
 					line.cells[dest_col] = cell;
@@ -1276,7 +1275,8 @@ void terminal_widget::rebuild_history_view()
 		}
 		for (int col = 0; col < end; ++col) {
 			paragraph.append(line.cells[col]);
-			paragraph_source_offsets.append(line.source_offset + col);
+			paragraph_source_offsets.append(line.source_offset +
+							col);
 		}
 
 		if (!continues)

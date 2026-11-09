@@ -4,11 +4,12 @@
 #include <QClipboard>
 #include <QColor>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFontDatabase>
 #include <QFontMetricsF>
-#include <QHash>
 #include <QGuiApplication>
+#include <QHash>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QLocale>
@@ -17,10 +18,13 @@
 #include <QPainter>
 #include <QResizeEvent>
 #include <QStringList>
+#include <QTextStream>
 
 #include <algorithm>
+#include <cmath>
 
-namespace {
+namespace
+{
 
 bool unicode_trace_enabled()
 {
@@ -30,8 +34,9 @@ bool unicode_trace_enabled()
 void write_unicode_trace(const QString &message)
 {
 	static bool first_write = true;
-	QFile file(QDir(QDir::tempPath())
-			   .filePath(QStringLiteral("himashinya-unicode-trace.log")));
+	QFile file(
+	    QDir(QDir::tempPath())
+		.filePath(QStringLiteral("himashinya-unicode-trace.log")));
 	QIODevice::OpenMode mode = QIODevice::WriteOnly;
 	mode |= first_write ? QIODevice::Truncate : QIODevice::Append;
 	if (!file.open(mode))
@@ -46,8 +51,8 @@ QString codepoint_trace(const QString &text)
 {
 	QStringList codepoints;
 	for (uint codepoint : text.toUcs4())
-		codepoints.append(QStringLiteral("U+%1").arg(
-			codepoint, 4, 16, QLatin1Char('0')));
+		codepoints.append(QStringLiteral("U+%1").arg(codepoint, 4, 16,
+							     QLatin1Char('0')));
 	return codepoints.join(QLatin1Char(' '));
 }
 
@@ -55,7 +60,7 @@ QFontDatabase::WritingSystem writing_system_for(const QString &text)
 {
 	for (uint codepoint : text.toUcs4()) {
 		const auto script =
-			QChar::script(static_cast<char32_t>(codepoint));
+		    QChar::script(static_cast<char32_t>(codepoint));
 		switch (script) {
 		case QChar::Script_Common:
 		case QChar::Script_Inherited:
@@ -123,7 +128,8 @@ QFontDatabase::WritingSystem writing_system_for(const QString &text)
 			case QLocale::Korean:
 				return QFontDatabase::Korean;
 			case QLocale::Chinese:
-				return QLocale().territory() == QLocale::Taiwan ||
+				return QLocale().territory() ==
+						   QLocale::Taiwan ||
 					       QLocale().territory() ==
 						   QLocale::HongKong ||
 					       QLocale().territory() ==
@@ -193,10 +199,10 @@ QString fallback_font_family(QFontDatabase::WritingSystem writing_system)
 	return family;
 }
 
-QFont cell_font(const QFont &terminal_font, const QString &text)
+QFont cell_font(const QFont &terminal_font,
+		QFontDatabase::WritingSystem writing_system)
 {
 	QFont font = terminal_font;
-	const auto writing_system = writing_system_for(text);
 	if (writing_system != QFontDatabase::Any &&
 	    writing_system != QFontDatabase::Latin) {
 		const QString family = fallback_font_family(writing_system);
@@ -216,14 +222,70 @@ terminal_widget::terminal_widget(QWidget *parent) : QWidget(parent)
 {
 	setFocusPolicy(Qt::StrongFocus);
 
+	render_profiling_enabled =
+	    qEnvironmentVariableIsSet("HIMASHINYA_PROFILE_RENDER");
+	if (render_profiling_enabled) {
+		static bool profile_log_initialized = false;
+		render_profile_path =
+		    QDir::temp().filePath("himashinya-render-profile.log");
+		QFile profile(render_profile_path);
+		QIODevice::OpenMode profile_mode =
+		    QIODevice::WriteOnly | QIODevice::Text;
+		profile_mode |= profile_log_initialized ? QIODevice::Append
+							: QIODevice::Truncate;
+		if (!profile.open(profile_mode)) {
+			qWarning("Cannot open render profile log: %s",
+				 qPrintable(render_profile_path));
+			render_profiling_enabled = false;
+		} else {
+			if (!profile_log_initialized) {
+				profile.write(
+				    "Himashinya terminal render profile\n");
+				profile_log_initialized = true;
+			}
+			paint_interval_clock.start();
+			event_loop_clock.start();
+
+			render_profile_timer = new QTimer(this);
+			render_profile_timer->setInterval(1000);
+			connect(render_profile_timer, &QTimer::timeout, this,
+				&terminal_widget::report_render_metrics);
+			render_profile_timer->start();
+
+			event_loop_timer = new QTimer(this);
+			event_loop_timer->setTimerType(Qt::PreciseTimer);
+			event_loop_timer->setInterval(16);
+			connect(
+			    event_loop_timer, &QTimer::timeout, this, [this]() {
+				    const qint64 gap_ns =
+					event_loop_clock.nsecsElapsed();
+				    event_loop_clock.restart();
+				    ++event_loop_tick_count;
+				    if (gap_ns > 20'000'000)
+					    ++event_loop_late_tick_count;
+				    event_loop_max_gap_ns =
+					std::max(event_loop_max_gap_ns, gap_ns);
+			    });
+			event_loop_timer->start();
+		}
+	}
+
 	selection_scroll_timer = new QTimer(this);
 	selection_scroll_timer->setInterval(40);
 
 	connect(selection_scroll_timer, &QTimer::timeout, this,
 		&terminal_widget::scroll_selection);
 
+	render_update_timer = new QTimer(this);
+	render_update_timer->setSingleShot(true);
+	render_update_timer->setTimerType(Qt::PreciseTimer);
+	render_update_timer->setInterval(0);
+	connect(render_update_timer, &QTimer::timeout, this,
+		&terminal_widget::flush_terminal_updates);
+
 	setAttribute(Qt::WA_InputMethodEnabled);
 	setAttribute(Qt::WA_OpaquePaintEvent);
+	setAttribute(Qt::WA_StaticContents);
 
 	terminal_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
 	terminal_font.setPointSize(11);
@@ -270,6 +332,11 @@ terminal_widget::~terminal_widget()
 		vterm_free(vterm);
 }
 
+QSizeF terminal_widget::cell_size() const
+{
+	return QSizeF(cell_width, cell_height);
+}
+
 int terminal_widget::damage_callback(VTermRect rect, void *user)
 {
 	auto *self = static_cast<terminal_widget *>(user);
@@ -281,7 +348,7 @@ int terminal_widget::damage_callback(VTermRect rect, void *user)
 		   static_cast<int>((rect.end_row - rect.start_row) *
 				    self->cell_height));
 
-	self->update(area);
+	self->mark_terminal_dirty(area);
 
 	return 1;
 }
@@ -290,10 +357,18 @@ int terminal_widget::cursor_callback(VTermPos pos, VTermPos, int visible,
 				     void *user)
 {
 	auto *self = static_cast<terminal_widget *>(user);
-
+	const VTermPos old_pos = self->cursor_position;
+	const bool was_visible = self->cursor_visible;
 	self->cursor_position = pos;
 	self->cursor_visible = visible != 0;
-	self->update();
+	if (was_visible)
+		self->update(QRect(old_pos.col * self->cell_width,
+				   old_pos.row * self->cell_height,
+				   self->cell_width, self->cell_height));
+	if (self->cursor_visible)
+		self->update(QRect(pos.col * self->cell_width,
+				   pos.row * self->cell_height,
+				   self->cell_width, self->cell_height));
 
 	return 1;
 }
@@ -306,9 +381,9 @@ void terminal_widget::output_callback(const char *data, size_t len, void *user)
 		if (std::any_of(bytes.cbegin(), bytes.cend(), [](char byte) {
 			    return static_cast<unsigned char>(byte) >= 0x80;
 		    }))
-			write_unicode_trace(QStringLiteral("terminal tx hex: %1")
-						     .arg(QString::fromLatin1(
-							     bytes.toHex(' '))));
+			write_unicode_trace(
+			    QStringLiteral("terminal tx hex: %1")
+				.arg(QString::fromLatin1(bytes.toHex(' '))));
 	}
 
 	emit self->send_data(QByteArray(data, static_cast<qsizetype>(len)));
@@ -322,8 +397,9 @@ void terminal_widget::feed_output(const QByteArray &data)
 	    std::any_of(data.cbegin(), data.cend(), [](char byte) {
 		    return static_cast<unsigned char>(byte) >= 0x80;
 	    }))
-		write_unicode_trace(QStringLiteral("ssh rx hex: %1")
-					    .arg(QString::fromLatin1(data.toHex(' '))));
+		write_unicode_trace(
+		    QStringLiteral("ssh rx hex: %1")
+			.arg(QString::fromLatin1(data.toHex(' '))));
 
 	vterm_input_write(vterm, data.constData(),
 			  static_cast<size_t>(data.size()));
@@ -359,7 +435,8 @@ QString terminal_widget::cell_text(const VTermScreenCell &cell) const
 }
 
 void terminal_widget::draw_cell(QPainter &painter, int row, int col,
-				int logical_row, const VTermScreenCell &cell)
+				const VTermScreenCell &cell,
+				bool draw_background)
 {
 	if (cell.width == 0)
 		return;
@@ -379,31 +456,43 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 		    cell_width * std::max(1, static_cast<int>(cell.width)),
 		    cell_height);
 
-	if (!wide_char_continuation)
+	if (draw_background && !wide_char_continuation)
 		painter.fillRect(rect, bg);
 
 	QString text = wide_char_continuation ? QString() : cell_text(cell);
 
 	if (!text.trimmed().isEmpty()) {
-		QFont font = cell_font(terminal_font, text);
-		font.setBold(cell.attrs.bold);
-		font.setItalic(cell.attrs.italic);
-		font.setUnderline(cell.attrs.underline != 0);
-		font.setStrikeOut(cell.attrs.strike);
+		const auto writing_system = writing_system_for(text);
+		const int style_key = (cell.attrs.bold ? 1 : 0) |
+				      (cell.attrs.italic ? 2 : 0) |
+				      (cell.attrs.underline ? 4 : 0) |
+				      (cell.attrs.strike ? 8 : 0);
+		const int font_key =
+		    static_cast<int>(writing_system) * 16 + style_key;
+		auto font_it = cell_font_cache.find(font_key);
+		if (font_it == cell_font_cache.end()) {
+			QFont font = cell_font(terminal_font, writing_system);
+			font.setBold(cell.attrs.bold);
+			font.setItalic(cell.attrs.italic);
+			font.setUnderline(cell.attrs.underline != 0);
+			font.setStrikeOut(cell.attrs.strike);
+			font_it = cell_font_cache.insert(font_key, font);
+		}
+		const QFont &font = font_it.value();
 
 		painter.setFont(font);
 		painter.setPen(fg);
 
 		if (cell.width > 1) {
 			const QFontMetricsF metrics(font);
-			const qreal text_width = metrics.horizontalAdvance(text);
-			const qreal text_x = rect.x() +
-					     std::max<qreal>(
-						 0, (rect.width() - text_width) /
-							    2);
+			const qreal text_width =
+			    metrics.horizontalAdvance(text);
+			const qreal text_x =
+			    rect.x() +
+			    std::max<qreal>(0, (rect.width() - text_width) / 2);
 			const qreal baseline =
-				rect.y() + (rect.height() - metrics.height()) / 2 +
-				metrics.ascent();
+			    rect.y() + (rect.height() - metrics.height()) / 2 +
+			    metrics.ascent();
 			painter.drawText(QPointF(text_x, baseline), text);
 		} else {
 			painter.drawText(rect, Qt::AlignLeft | Qt::AlignVCenter,
@@ -411,83 +500,231 @@ void terminal_widget::draw_cell(QPainter &painter, int row, int col,
 		}
 	}
 
-	if (has_selection) {
-		QPoint start = selection_start;
-		QPoint end = selection_end;
+}
 
-		if (start.y() > end.y() ||
-		    (start.y() == end.y() && start.x() > end.x()))
-			std::swap(start, end);
+void terminal_widget::ensure_terminal_buffer()
+{
+	const QSize buffer_size(
+	    std::max(1, static_cast<int>(std::ceil(columns * cell_width))),
+	    std::max(1, static_cast<int>(std::ceil(rows * cell_height))));
+	if (terminal_buffer.size() == buffer_size)
+		return;
 
-		bool selected =
-		    (logical_row > start.y() ||
-		     (logical_row == start.y() && col >= start.x())) &&
-		    (logical_row < end.y() ||
-		     (logical_row == end.y() && col <= end.x()));
+	terminal_buffer = QImage(buffer_size,
+				 QImage::Format_ARGB32_Premultiplied);
+	if (terminal_buffer.isNull())
+		return;
 
-		if (selected)
-			painter.fillRect(rect, QColor(80, 140, 220, 100));
+	terminal_buffer.fill(QColor("#1e1e1e"));
+	terminal_dirty_region = QRegion(terminal_buffer.rect());
+	render_update_timer->start();
+}
+
+void terminal_widget::mark_terminal_dirty(const QRect &area)
+{
+	if (area.isEmpty())
+		return;
+
+	terminal_dirty_region += area;
+	if (!render_update_timer->isActive())
+		render_update_timer->start();
+}
+
+void terminal_widget::flush_terminal_updates()
+{
+	ensure_terminal_buffer();
+	render_update_timer->stop();
+	if (terminal_buffer.isNull() || !screen)
+		return;
+
+	const QRegion pending_damage =
+	    terminal_dirty_region.intersected(terminal_buffer.rect());
+	terminal_dirty_region = QRegion();
+	if (pending_damage.isEmpty())
+		return;
+
+	quint64 cells_drawn = 0;
+	for (const QRect &area : pending_damage) {
+		cells_drawn += render_terminal_region(area);
+		update(area);
+	}
+	if (render_profiling_enabled) {
+		++render_buffer_update_count;
+		render_cell_count += cells_drawn;
+	}
+}
+
+void terminal_widget::invalidate_terminal_buffer()
+{
+	const QRect terminal_area(
+	    0, 0,
+	    std::max(1, static_cast<int>(std::ceil(columns * cell_width))),
+	    std::max(1, static_cast<int>(std::ceil(rows * cell_height))));
+	mark_terminal_dirty(terminal_area);
+}
+
+quint64 terminal_widget::render_terminal_region(const QRect &area)
+{
+	const QRect clipped_area = area.intersected(terminal_buffer.rect());
+	if (clipped_area.isEmpty() || !screen)
+		return 0;
+
+	QPainter painter(&terminal_buffer);
+	painter.setClipRect(clipped_area);
+	painter.fillRect(clipped_area, QColor("#1e1e1e"));
+
+	const int first_row = std::clamp(
+	    static_cast<int>(clipped_area.top() / cell_height), 0, rows - 1);
+	const int last_row = std::clamp(
+	    static_cast<int>(clipped_area.bottom() / cell_height), 0, rows - 1);
+	const int first_col = std::clamp(
+	    static_cast<int>(clipped_area.left() / cell_width), 0, columns - 1);
+	const int last_col = std::clamp(
+	    static_cast<int>(clipped_area.right() / cell_width), 0, columns - 1);
+	quint64 cells_drawn = 0;
+	const int row_cell_count = last_col - first_col + 1;
+	QVector<VTermScreenCell> row_cells(row_cell_count);
+	QVector<QColor> row_backgrounds(row_cell_count);
+	QVector<bool> row_cell_valid(row_cell_count);
+
+	for (int row = first_row; row <= last_row; ++row) {
+		const int logical_row =
+		    static_cast<int>(history.size()) - scroll_offset + row;
+
+		for (int col = first_col; col <= last_col; ++col) {
+			const int index = col - first_col;
+			VTermScreenCell cell = {};
+			bool valid = false;
+
+			if (logical_row < static_cast<int>(history.size())) {
+				if (logical_row >= 0) {
+					const auto &line = history[logical_row].cells;
+					if (col < line.size()) {
+						cell = line[col];
+						valid = true;
+					}
+				}
+			} else {
+				const int screen_row =
+				    logical_row -
+				    static_cast<int>(history.size());
+				const VTermPos pos = {screen_row, col};
+				valid = vterm_screen_get_cell(screen, pos, &cell);
+			}
+
+			row_cells[index] = cell;
+			row_cell_valid[index] = valid;
+
+			QColor background("#1e1e1e");
+			if (valid) {
+				QColor foreground = cell_color(cell.fg);
+				background = cell_color(cell.bg);
+				if (cell.attrs.reverse)
+					std::swap(foreground, background);
+				++cells_drawn;
+			}
+			row_backgrounds[index] = background;
+		}
+
+		int run_start = 0;
+		while (run_start < row_cell_count) {
+			int run_end = run_start + 1;
+			while (run_end < row_cell_count &&
+			       row_backgrounds[run_end] ==
+				   row_backgrounds[run_start])
+				++run_end;
+
+			painter.fillRect(
+			    QRectF((first_col + run_start) * cell_width,
+				   row * cell_height,
+				   (run_end - run_start) * cell_width,
+				   cell_height),
+			    row_backgrounds[run_start]);
+			run_start = run_end;
+		}
+
+		for (int col = first_col; col <= last_col; ++col) {
+			const int index = col - first_col;
+			const VTermScreenCell &cell = row_cells[index];
+			if (!row_cell_valid[index] || cell.width == 0 ||
+			    cell.chars[0] == 0 ||
+			    cell.chars[0] == UINT32_MAX)
+				continue;
+
+			draw_cell(painter, row, col, cell, false);
+		}
+	}
+
+	painter.end();
+	return cells_drawn;
+}
+
+void terminal_widget::draw_selection_overlay(QPainter &painter,
+					     const QRect &area)
+{
+	if (!has_selection)
+		return;
+
+	QPoint start = selection_start;
+	QPoint end = selection_end;
+	if (start.y() > end.y() ||
+	    (start.y() == end.y() && start.x() > end.x()))
+		std::swap(start, end);
+
+	const int first_row = std::clamp(
+	    static_cast<int>(area.top() / cell_height), 0, rows - 1);
+	const int last_row = std::clamp(
+	    static_cast<int>(area.bottom() / cell_height), 0, rows - 1);
+	const int first_col = std::clamp(
+	    static_cast<int>(area.left() / cell_width), 0, columns - 1);
+	const int last_col = std::clamp(
+	    static_cast<int>(area.right() / cell_width), 0, columns - 1);
+
+	for (int row = first_row; row <= last_row; ++row) {
+		const int logical_row =
+		    static_cast<int>(history.size()) - scroll_offset + row;
+		if (logical_row < start.y() || logical_row > end.y())
+			continue;
+
+		const int left_col =
+		    std::max(first_col,
+			     logical_row == start.y() ? start.x() : 0);
+		const int right_col =
+		    std::min(last_col, logical_row == end.y() ? end.x()
+								: columns - 1);
+		if (left_col > right_col)
+			continue;
+
+		painter.fillRect(
+		    QRectF(left_col * cell_width, row * cell_height,
+			   (right_col - left_col + 1) * cell_width,
+			   cell_height),
+		    QColor(80, 140, 220, 100));
 	}
 }
 
 void terminal_widget::paintEvent(QPaintEvent *event)
 {
-	QPainter painter(this);
+	QElapsedTimer paint_clock;
+	if (render_profiling_enabled)
+		paint_clock.start();
 
-	const QRect dirty_rect = event->region().boundingRect().intersected(rect());
-	if (dirty_rect.isEmpty())
+	const QRect dirty_rect =
+	    event->region().boundingRect().intersected(rect());
+	if (dirty_rect.isEmpty()) {
+		if (render_profiling_enabled)
+			record_paint_metrics(paint_clock.nsecsElapsed());
 		return;
-
-	painter.fillRect(dirty_rect, QColor("#1e1e1e"));
-	painter.setFont(terminal_font);
-
-	if (!screen)
-		return;
-
-	const int first_row =
-		std::clamp(static_cast<int>(dirty_rect.top() / cell_height),
-			   0, rows - 1);
-	const int last_row =
-		std::clamp(static_cast<int>(dirty_rect.bottom() / cell_height),
-			   0, rows - 1);
-	const int first_col =
-		std::clamp(static_cast<int>(dirty_rect.left() / cell_width), 0,
-			   columns - 1);
-	const int last_col =
-		std::clamp(static_cast<int>(dirty_rect.right() / cell_width), 0,
-			   columns - 1);
-
-	for (int row = first_row; row <= last_row; ++row) {
-		int logical_row =
-		    static_cast<int>(history.size()) - scroll_offset + row;
-
-		for (int col = first_col; col <= last_col; ++col) {
-			VTermScreenCell cell = {};
-
-			if (logical_row < static_cast<int>(history.size())) {
-				if (logical_row < 0)
-					continue;
-
-				const auto &line = history[logical_row].cells;
-
-				if (col >= line.size())
-					continue;
-
-				cell = line[col];
-			} else {
-				int screen_row =
-				    logical_row -
-				    static_cast<int>(history.size());
-
-				VTermPos pos = {screen_row, col};
-
-				if (!vterm_screen_get_cell(screen, pos, &cell))
-					continue;
-			}
-
-			draw_cell(painter, row, col, logical_row, cell);
-		}
 	}
+
+	QPainter painter(this);
+	painter.fillRect(dirty_rect, QColor("#1e1e1e"));
+	const QRect visible_buffer =
+	    dirty_rect.intersected(terminal_buffer.rect());
+	if (!visible_buffer.isEmpty())
+		painter.drawImage(visible_buffer, terminal_buffer, visible_buffer);
+
+	draw_selection_overlay(painter, dirty_rect);
 
 	if (scroll_offset == 0 && cursor_visible && ime_preedit.isEmpty()) {
 		QRectF cursor(cursor_position.col * cell_width,
@@ -504,44 +741,109 @@ void terminal_widget::paintEvent(QPaintEvent *event)
 		const qreal x = col * cell_width;
 		const qreal y = row * cell_height;
 		const qreal available_width = std::max<qreal>(0, width() - x);
-		const QFont font = cell_font(terminal_font, ime_preedit);
+		const QFont font =
+		    cell_font(terminal_font, writing_system_for(ime_preedit));
 		const QFontMetricsF metrics(font);
 		const qreal text_width = metrics.horizontalAdvance(ime_preedit);
-		const qreal preedit_width =
-			std::min(available_width,
-				 std::max<qreal>(cell_width, text_width));
+		const qreal preedit_width = std::min(
+		    available_width, std::max<qreal>(cell_width, text_width));
 		const QRectF preedit_rect(x, y, preedit_width, cell_height);
 
 		painter.fillRect(preedit_rect, QColor(55, 55, 55, 220));
 		painter.setFont(font);
 		painter.setPen(QColor("#ffffff"));
 		const qreal baseline =
-			y + (cell_height - metrics.height()) / 2 + metrics.ascent();
+		    y + (cell_height - metrics.height()) / 2 + metrics.ascent();
 		painter.drawText(QPointF(x, baseline), ime_preedit);
 
 		const qreal underline_width =
-			std::min(available_width, text_width);
-		painter.drawLine(QPointF(x, y + cell_height - 1),
-				 QPointF(x + underline_width,
-					 y + cell_height - 1));
+		    std::min(available_width, text_width);
+		painter.drawLine(
+		    QPointF(x, y + cell_height - 1),
+		    QPointF(x + underline_width, y + cell_height - 1));
 
 		if (ime_preedit_cursor_visible) {
 			const QString prefix =
-				ime_preedit.left(ime_preedit_cursor);
+			    ime_preedit.left(ime_preedit_cursor);
 			const qreal cursor_x =
-				x + std::min(available_width,
-					     metrics.horizontalAdvance(prefix));
-			painter.drawLine(QPointF(cursor_x, y + 2),
-					 QPointF(cursor_x,
-						 y + cell_height - 2));
+			    x + std::min(available_width,
+					 metrics.horizontalAdvance(prefix));
+			painter.drawLine(
+			    QPointF(cursor_x, y + 2),
+			    QPointF(cursor_x, y + cell_height - 2));
 		}
 	}
+
+	painter.end();
+	if (render_profiling_enabled)
+		record_paint_metrics(paint_clock.nsecsElapsed());
 }
 
 void terminal_widget::resizeEvent(QResizeEvent *event)
 {
 	QWidget::resizeEvent(event);
+	if (render_profiling_enabled)
+		++resize_event_count;
 	update_terminal_size();
+}
+
+void terminal_widget::record_paint_metrics(qint64 elapsed_ns)
+{
+	++render_paint_count;
+	render_paint_total_ns += elapsed_ns;
+	render_paint_max_ns = std::max(render_paint_max_ns, elapsed_ns);
+}
+
+void terminal_widget::report_render_metrics()
+{
+	const qint64 interval_ns = paint_interval_clock.nsecsElapsed();
+	paint_interval_clock.restart();
+	if (interval_ns <= 0)
+		return;
+
+	const double interval_seconds = interval_ns / 1'000'000'000.0;
+	const double average_paint_ms =
+	    render_paint_count == 0
+		? 0.0
+		: render_paint_total_ns / 1'000'000.0 / render_paint_count;
+	const QString line =
+	    QStringLiteral("paint_fps=%1 buffer_fps=%2 "
+			   "avg_paint_ms=%3 max_paint_ms=%4 "
+			   "cells_per_sec=%5 resize_events=%6 "
+			   "loop_ticks=%7 late_loop_ticks=%8 "
+			   "max_loop_gap_ms=%9\n")
+		.arg(render_paint_count / interval_seconds, 0, 'f', 1)
+		.arg(render_buffer_update_count / interval_seconds, 0, 'f',
+		     1)
+		.arg(average_paint_ms, 0, 'f', 3)
+		.arg(render_paint_max_ns / 1'000'000.0, 0, 'f', 3)
+		.arg(qRound64(render_cell_count / interval_seconds))
+		.arg(resize_event_count)
+		.arg(event_loop_tick_count)
+		.arg(event_loop_late_tick_count)
+		.arg(event_loop_max_gap_ns / 1'000'000.0, 0, 'f', 3);
+
+	QFile profile(render_profile_path);
+	if (!profile.open(QIODevice::WriteOnly | QIODevice::Append |
+			  QIODevice::Text)) {
+		qWarning("Cannot write render profile log: %s",
+			 qPrintable(render_profile_path));
+		render_profile_timer->stop();
+		event_loop_timer->stop();
+		render_profiling_enabled = false;
+		return;
+	}
+	QTextStream(&profile) << line;
+
+	render_paint_count = 0;
+	render_buffer_update_count = 0;
+	render_cell_count = 0;
+	render_paint_total_ns = 0;
+	render_paint_max_ns = 0;
+	resize_event_count = 0;
+	event_loop_tick_count = 0;
+	event_loop_late_tick_count = 0;
+	event_loop_max_gap_ns = 0;
 }
 
 void terminal_widget::set_terminal_font(const QFont &font)
@@ -549,26 +851,30 @@ void terminal_widget::set_terminal_font(const QFont &font)
 	terminal_font = font;
 	terminal_font.setStyleHint(QFont::Monospace);
 	terminal_font.setFixedPitch(true);
+	cell_font_cache.clear();
 
 	QFontMetricsF metrics(terminal_font);
 	cell_width = metrics.horizontalAdvance(QLatin1Char('M'));
 	cell_height = metrics.height();
 
 	update_terminal_size();
+	invalidate_terminal_buffer();
 	update();
 }
 
 void terminal_widget::update_terminal_size()
 {
-	if (!vterm || cell_width <= 0 || cell_height <= 0)
+	if (!vterm || cell_width <= 0 || cell_height <= 0) {
 		return;
+	}
 
 	int new_columns = std::max(1, static_cast<int>(width() / cell_width));
 
 	int new_rows = std::max(1, static_cast<int>(height() / cell_height));
 
-	if (new_columns == columns && new_rows == rows)
+	if (new_columns == columns && new_rows == rows) {
 		return;
+	}
 
 	columns = new_columns;
 	rows = new_rows;
@@ -576,6 +882,7 @@ void terminal_widget::update_terminal_size()
 	vterm_set_size(vterm, rows, columns);
 
 	emit resize_requested(columns, rows);
+	invalidate_terminal_buffer();
 	update();
 }
 
@@ -708,20 +1015,23 @@ void terminal_widget::keyPressEvent(QKeyEvent *event)
 	} else {
 		const QString text = event->text();
 		if (unicode_trace_enabled() && !text.isEmpty())
-			write_unicode_trace(QStringLiteral("key text codepoints: %1")
-					     .arg(codepoint_trace(text)));
+			write_unicode_trace(
+			    QStringLiteral("key text codepoints: %1")
+				.arg(codepoint_trace(text)));
 		if (ime_composing && !text.isEmpty()) {
 			event->accept();
 			return;
 		}
 
 		/* Non-ASCII text from an input method must arrive through
-		 * inputMethodEvent() as committed text. Forwarding key-event text
-		 * here can leak intermediate IME composition into the remote shell.
+		 * inputMethodEvent() as committed text. Forwarding key-event
+		 * text here can leak intermediate IME composition into the
+		 * remote shell.
 		 */
 		const auto codepoints = text.toUcs4();
-		if (std::any_of(codepoints.cbegin(), codepoints.cend(),
-				[](uint codepoint) { return codepoint > 0x7f; })) {
+		if (std::any_of(
+			codepoints.cbegin(), codepoints.cend(),
+			[](uint codepoint) { return codepoint > 0x7f; })) {
 			event->accept();
 			return;
 		}
@@ -737,9 +1047,9 @@ void terminal_widget::inputMethodEvent(QInputMethodEvent *event)
 {
 	if (unicode_trace_enabled()) {
 		write_unicode_trace(
-			QStringLiteral("IME preedit: %1 | commit: %2")
-				.arg(codepoint_trace(event->preeditString()),
-				     codepoint_trace(event->commitString())));
+		    QStringLiteral("IME preedit: %1 | commit: %2")
+			.arg(codepoint_trace(event->preeditString()),
+			     codepoint_trace(event->commitString())));
 	}
 	ime_preedit = event->preeditString();
 	ime_composing = !ime_preedit.isEmpty();
@@ -749,12 +1059,10 @@ void terminal_widget::inputMethodEvent(QInputMethodEvent *event)
 	for (const QInputMethodEvent::Attribute &attribute :
 	     event->attributes()) {
 		if (attribute.type == QInputMethodEvent::Cursor) {
-			ime_preedit_cursor = static_cast<int>(
-				std::clamp<qsizetype>(
-					attribute.start, 0,
-					ime_preedit.size()));
-			ime_preedit_cursor_visible =
-				attribute.length != 0;
+			ime_preedit_cursor =
+			    static_cast<int>(std::clamp<qsizetype>(
+				attribute.start, 0, ime_preedit.size()));
+			ime_preedit_cursor_visible = attribute.length != 0;
 			break;
 		}
 	}
@@ -786,11 +1094,11 @@ QVariant terminal_widget::inputMethodQuery(Qt::InputMethodQuery query) const
 		qreal width = cell_width;
 
 		if (!ime_preedit.isEmpty()) {
-			const QFont font =
-				cell_font(terminal_font, ime_preedit);
+			const QFont font = cell_font(
+			    terminal_font, writing_system_for(ime_preedit));
 			const QFontMetricsF metrics(font);
 			x += metrics.horizontalAdvance(
-				ime_preedit.left(ime_preedit_cursor));
+			    ime_preedit.left(ime_preedit_cursor));
 			width = 1;
 		}
 
@@ -820,6 +1128,7 @@ int terminal_widget::scrollback_pushline(int cols, const VTermScreenCell *cells,
 		    std::min(self->scroll_offset + 1,
 			     static_cast<int>(self->history.size()));
 	}
+	self->invalidate_terminal_buffer();
 
 	return 1;
 }
@@ -845,6 +1154,7 @@ int terminal_widget::scrollback_popline(int cols, VTermScreenCell *cells,
 
 	self->scroll_offset = std::min(self->scroll_offset,
 				       static_cast<int>(self->history.size()));
+	self->invalidate_terminal_buffer();
 
 	return 1;
 }
@@ -866,6 +1176,7 @@ void terminal_widget::scroll_history(int lines)
 {
 	scroll_offset = std::clamp(scroll_offset + lines, 0,
 				   static_cast<int>(history.size()));
+	invalidate_terminal_buffer();
 
 	update();
 }
@@ -1090,7 +1401,7 @@ void terminal_widget::scroll_selection()
 }
 
 void terminal_widget::update_selection_area(const QPoint &first,
-					   const QPoint &second)
+					    const QPoint &second)
 {
 	const int top_row = std::min(first.y(), second.y());
 	const int bottom_row = std::max(first.y(), second.y());
@@ -1100,25 +1411,24 @@ void terminal_widget::update_selection_area(const QPoint &first,
 	if (top_row == bottom_row) {
 		left_col = std::max(0, std::min(first.x(), second.x()) - 1);
 		right_col =
-			std::min(columns - 1,
-				 std::max(first.x(), second.x()) + 1);
+		    std::min(columns - 1, std::max(first.x(), second.x()) + 1);
 	}
 
 	const int first_visible_row =
-		static_cast<int>(history.size()) - scroll_offset;
+	    static_cast<int>(history.size()) - scroll_offset;
 	const int screen_top = std::max(top_row, first_visible_row);
 	const int screen_bottom =
-		std::min(bottom_row, first_visible_row + rows - 1);
+	    std::min(bottom_row, first_visible_row + rows - 1);
 
 	if (screen_top > screen_bottom)
 		return;
 
 	const int top = (screen_top - first_visible_row) * cell_height;
 	const int bottom =
-		(screen_bottom - first_visible_row + 1) * cell_height;
+	    (screen_bottom - first_visible_row + 1) * cell_height;
 	const int left = static_cast<int>(left_col * cell_width);
 	const int right = static_cast<int>(
-		std::min<qreal>(width(), (right_col + 1) * cell_width));
+	    std::min<qreal>(width(), (right_col + 1) * cell_width));
 
 	update(QRect(left, top, std::max(1, right - left),
 		     std::max(1, bottom - top)));

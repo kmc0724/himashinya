@@ -3,6 +3,7 @@
 #include "server_profile.h"
 #include "server_repository.h"
 
+#include <QByteArray>
 #include <QFont>
 #include <QList>
 #include <QMainWindow>
@@ -21,6 +22,10 @@ public:
 	~main_window() override;
 
 	void connect_server();
+
+protected:
+	bool nativeEvent(const QByteArray &event_type, void *message,
+			 qintptr *result) override;
 
 private:
 	void setup_ui();

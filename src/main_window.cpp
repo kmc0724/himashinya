@@ -6,6 +6,7 @@
 #include <QAction>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDebug>
 #include <QFontDatabase>
 #include <QFontDialog>
 #include <QFormLayout>
@@ -26,6 +27,14 @@
 #include <QVBoxLayout>
 #include <QVariant>
 #include <QWidget>
+#include <QtMath>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 main_window::main_window(QWidget *parent) : QMainWindow(parent)
 {
@@ -155,6 +164,137 @@ void main_window::setup_ui()
 	splitter->setSizes({280, 920});
 
 	setCentralWidget(splitter);
+}
+
+bool main_window::nativeEvent(const QByteArray &event_type, void *message,
+			      qintptr *result)
+{
+#ifdef Q_OS_WIN
+	Q_UNUSED(event_type);
+	auto *native_message = static_cast<MSG *>(message);
+	if (native_message->message == WM_SIZING && terminal_tabs) {
+		auto *terminal = qobject_cast<terminal_widget *>(
+		    terminal_tabs->currentWidget());
+		if (terminal) {
+			const QSizeF cell = terminal->cell_size();
+			const qreal device_pixel_ratio =
+			    terminal->devicePixelRatioF();
+			if (cell.width() > 0 && cell.height() > 0 &&
+			    device_pixel_ratio > 0) {
+				const qreal cell_width =
+				    cell.width() * device_pixel_ratio;
+				const qreal cell_height =
+				    cell.height() * device_pixel_ratio;
+				const qreal terminal_width =
+				    terminal->width() * device_pixel_ratio;
+				const qreal terminal_height =
+				    terminal->height() * device_pixel_ratio;
+				auto *rect = reinterpret_cast<RECT *>(
+				    native_message->lParam);
+				const LONG proposed_outer_width =
+				    rect->right - rect->left;
+				const LONG proposed_outer_height =
+				    rect->bottom - rect->top;
+				RECT actual_rect{};
+				if (!GetWindowRect(native_message->hwnd,
+						   &actual_rect)) {
+					qWarning("GetWindowRect failed while snapping "
+						 "terminal resize: %lu",
+						 GetLastError());
+					return QMainWindow::nativeEvent(
+					    event_type, message, result);
+				}
+
+				const UINT edge =
+				    static_cast<UINT>(native_message->wParam);
+				const bool resize_left =
+				    edge == WMSZ_LEFT ||
+				    edge == WMSZ_TOPLEFT ||
+				    edge == WMSZ_BOTTOMLEFT;
+				const bool resize_right =
+				    edge == WMSZ_RIGHT ||
+				    edge == WMSZ_TOPRIGHT ||
+				    edge == WMSZ_BOTTOMRIGHT;
+				const bool resize_top =
+				    edge == WMSZ_TOP ||
+				    edge == WMSZ_TOPLEFT ||
+				    edge == WMSZ_TOPRIGHT;
+				const bool resize_bottom =
+				    edge == WMSZ_BOTTOM ||
+				    edge == WMSZ_BOTTOMLEFT ||
+				    edge == WMSZ_BOTTOMRIGHT;
+
+				if (resize_left || resize_right) {
+					const int current_window_width =
+					    actual_rect.right -
+					    actual_rect.left;
+					const qreal proposed_terminal_width =
+					    terminal_width +
+					    (proposed_outer_width -
+					     current_window_width);
+					const int minimum_cells = qMax(
+					    1, qCeil((terminal_width +
+						      (minimumWidth() -
+						       width()) *
+							  device_pixel_ratio) /
+						     cell_width));
+					const int cells = qMax(
+					    minimum_cells,
+					    qRound(proposed_terminal_width /
+						   cell_width));
+					const int target_width =
+					    current_window_width +
+					    qRound(cells * cell_width -
+						   terminal_width);
+					if (resize_left)
+						rect->left =
+						    rect->right - target_width;
+					else
+						rect->right =
+						    rect->left + target_width;
+				}
+
+				if (resize_top || resize_bottom) {
+					const int current_window_height =
+					    actual_rect.bottom -
+					    actual_rect.top;
+					const qreal proposed_terminal_height =
+					    terminal_height +
+					    (proposed_outer_height -
+					     current_window_height);
+					const int minimum_cells = qMax(
+					    1, qCeil((terminal_height +
+						      (minimumHeight() -
+						       height()) *
+							  device_pixel_ratio) /
+						     cell_height));
+					const int cells = qMax(
+					    minimum_cells,
+					    qRound(proposed_terminal_height /
+						   cell_height));
+					const int target_height =
+					    current_window_height +
+					    qRound(cells * cell_height -
+						   terminal_height);
+					if (resize_top)
+						rect->top =
+						    rect->bottom - target_height;
+					else
+						rect->bottom =
+						    rect->top + target_height;
+				}
+
+				*result = TRUE;
+				return true;
+			}
+		}
+	}
+#else
+	Q_UNUSED(event_type);
+	Q_UNUSED(message);
+	Q_UNUSED(result);
+#endif
+	return QMainWindow::nativeEvent(event_type, message, result);
 }
 
 void main_window::setup_style()

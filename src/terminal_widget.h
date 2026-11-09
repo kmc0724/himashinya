@@ -2,9 +2,14 @@
 #pragma once
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QFont>
+#include <QHash>
+#include <QImage>
 #include <QMouseEvent>
 #include <QPoint>
+#include <QRegion>
+#include <QString>
 #include <QTimer>
 #include <QVector>
 #include <QWheelEvent>
@@ -35,6 +40,7 @@ public:
 
 	void feed_output(const QByteArray &data);
 	void set_terminal_font(const QFont &font);
+	QSizeF cell_size() const;
 
 signals:
 	void send_data(const QByteArray &data);
@@ -54,8 +60,16 @@ private:
 	static void output_callback(const char *data, size_t len, void *user);
 
 	void update_terminal_size();
-	void draw_cell(QPainter &painter, int row, int col, int logical_row,
-		       const VTermScreenCell &cell);
+	void ensure_terminal_buffer();
+	void mark_terminal_dirty(const QRect &area);
+	void flush_terminal_updates();
+	void invalidate_terminal_buffer();
+	quint64 render_terminal_region(const QRect &area);
+	void draw_selection_overlay(QPainter &painter, const QRect &area);
+	void record_paint_metrics(qint64 elapsed_ns);
+	void report_render_metrics();
+	void draw_cell(QPainter &painter, int row, int col,
+		       const VTermScreenCell &cell, bool draw_background);
 
 	static int scrollback_pushline(int cols, const VTermScreenCell *cells,
 				       void *user);
@@ -80,6 +94,22 @@ private:
 	void paste_clipboard();
 
 	QTimer *selection_scroll_timer = nullptr;
+	QTimer *render_update_timer = nullptr;
+	QTimer *render_profile_timer = nullptr;
+	QTimer *event_loop_timer = nullptr;
+	QElapsedTimer paint_interval_clock;
+	QElapsedTimer event_loop_clock;
+	QString render_profile_path;
+	quint64 render_paint_count = 0;
+	quint64 render_buffer_update_count = 0;
+	quint64 render_cell_count = 0;
+	qint64 render_paint_total_ns = 0;
+	qint64 render_paint_max_ns = 0;
+	quint64 resize_event_count = 0;
+	quint64 event_loop_tick_count = 0;
+	quint64 event_loop_late_tick_count = 0;
+	qint64 event_loop_max_gap_ns = 0;
+	bool render_profiling_enabled = false;
 	QPoint selection_mouse_position;
 
 	void update_selection_autoscroll();
@@ -89,8 +119,11 @@ private:
 	VTerm *vterm = nullptr;
 	VTermScreen *screen = nullptr;
 	VTermState *state = nullptr;
+	QImage terminal_buffer;
+	QRegion terminal_dirty_region;
 
 	QFont terminal_font;
+	QHash<int, QFont> cell_font_cache;
 	QString ime_preedit;
 	bool ime_composing = false;
 	int ime_preedit_cursor = 0;

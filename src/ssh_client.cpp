@@ -5,7 +5,9 @@
 #include <QSaveFile>
 
 #include <fcntl.h>
+#include <chrono>
 #include <limits>
+#include <thread>
 
 ssh_client::~ssh_client()
 {
@@ -453,7 +455,8 @@ bool ssh_client::list_sftp_directory(const QString &path,
 
 bool ssh_client::download_sftp_file(
     const QString &remote_path, const QString &local_path,
-    const std::function<void(quint64, quint64)> &progress)
+    const std::function<void(quint64, quint64)> &progress,
+    const std::function<bool()> &cancelled)
 {
 	if (!sftp) {
 		error_message = "SFTP session is not initialized.";
@@ -476,6 +479,7 @@ bool ssh_client::download_sftp_file(
 		error_message = QString::fromUtf8(ssh_get_error(session));
 		return false;
 	}
+	sftp_file_set_nonblocking(remote_file);
 
 	QSaveFile local_file(local_path);
 	if (!local_file.open(QIODevice::WriteOnly)) {
@@ -488,9 +492,40 @@ bool ssh_client::download_sftp_file(
 	quint64 transferred = 0;
 	quint64 last_reported = 0;
 	bool success = true;
+	bool was_cancelled = false;
 	while (true) {
-		const ssize_t received =
-		    sftp_read(remote_file, buffer, sizeof(buffer));
+		if (cancelled()) {
+			was_cancelled = true;
+			success = false;
+			error_message = "Transfer cancelled.";
+			break;
+		}
+
+		sftp_aio aio = nullptr;
+		if (sftp_aio_begin_read(remote_file, sizeof(buffer), &aio) < 0) {
+			error_message = QString::fromUtf8(ssh_get_error(session));
+			success = false;
+			break;
+		}
+
+		ssize_t received = SSH_AGAIN;
+		while (received == SSH_AGAIN && !cancelled()) {
+			received = sftp_aio_wait_read(&aio, buffer,
+						      sizeof(buffer));
+			if (received == SSH_AGAIN)
+				std::this_thread::sleep_for(
+				    std::chrono::milliseconds(10));
+		}
+
+		if (cancelled()) {
+			if (aio)
+				sftp_aio_free(aio);
+			was_cancelled = true;
+			success = false;
+			error_message = "Transfer cancelled.";
+			break;
+		}
+
 		if (received < 0) {
 			error_message = QString::fromUtf8(ssh_get_error(session));
 			success = false;
@@ -522,7 +557,7 @@ bool ssh_client::download_sftp_file(
 		}
 	}
 
-	if (sftp_close(remote_file) != SSH_OK && success) {
+	if (!was_cancelled && sftp_close(remote_file) != SSH_OK && success) {
 		error_message = QString::fromUtf8(ssh_get_error(session));
 		success = false;
 	}
@@ -541,7 +576,8 @@ bool ssh_client::download_sftp_file(
 
 bool ssh_client::upload_sftp_file(
     const QString &local_path, const QString &remote_path,
-    const std::function<void(quint64, quint64)> &progress)
+    const std::function<void(quint64, quint64)> &progress,
+    const std::function<bool()> &cancelled)
 {
 	if (!sftp) {
 		error_message = "SFTP session is not initialized.";
@@ -562,13 +598,22 @@ bool ssh_client::upload_sftp_file(
 		error_message = QString::fromUtf8(ssh_get_error(session));
 		return false;
 	}
+	sftp_file_set_nonblocking(remote_file);
 
 	const quint64 total = static_cast<quint64>(local_file.size());
 	quint64 transferred = 0;
 	quint64 last_reported = 0;
 	char buffer[64 * 1024];
 	bool success = true;
+	bool was_cancelled = false;
 	while (true) {
+		if (cancelled()) {
+			was_cancelled = true;
+			success = false;
+			error_message = "Transfer cancelled.";
+			break;
+		}
+
 		const qint64 received = local_file.read(buffer, sizeof(buffer));
 		if (received < 0) {
 			error_message = local_file.errorString();
@@ -580,9 +625,41 @@ bool ssh_client::upload_sftp_file(
 
 		qsizetype written = 0;
 		while (written < received) {
-			const ssize_t count = sftp_write(
+			if (cancelled()) {
+				was_cancelled = true;
+				success = false;
+				error_message = "Transfer cancelled.";
+				break;
+			}
+
+			sftp_aio aio = nullptr;
+			const ssize_t requested = sftp_aio_begin_write(
 			    remote_file, buffer + written,
-			    static_cast<size_t>(received - written));
+			    static_cast<size_t>(received - written), &aio);
+			if (requested < 0) {
+				error_message =
+				    QString::fromUtf8(ssh_get_error(session));
+				success = false;
+				break;
+			}
+
+			ssize_t count = SSH_AGAIN;
+			while (count == SSH_AGAIN && !cancelled()) {
+				count = sftp_aio_wait_write(&aio);
+				if (count == SSH_AGAIN)
+					std::this_thread::sleep_for(
+					    std::chrono::milliseconds(10));
+			}
+
+			if (cancelled()) {
+				if (aio)
+					sftp_aio_free(aio);
+				was_cancelled = true;
+				success = false;
+				error_message = "Transfer cancelled.";
+				break;
+			}
+
 			if (count <= 0) {
 				error_message =
 				    QString::fromUtf8(ssh_get_error(session));
@@ -602,12 +679,12 @@ bool ssh_client::upload_sftp_file(
 		}
 	}
 
-	if (sftp_close(remote_file) != SSH_OK && success) {
+	if (!was_cancelled && sftp_close(remote_file) != SSH_OK && success) {
 		error_message = QString::fromUtf8(ssh_get_error(session));
 		success = false;
 	}
 
-	if (!success) {
+	if (!success && !was_cancelled) {
 		const QString transfer_error = error_message;
 		if (sftp_unlink(sftp, remote_path_bytes.constData()) != SSH_OK) {
 			error_message =

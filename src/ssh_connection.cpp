@@ -1,5 +1,6 @@
 
 #include "ssh_connection.h"
+#include "sftp_worker.h"
 #include "ssh_worker.h"
 
 ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
@@ -7,6 +8,9 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 {
 	worker = new ssh_worker(server.host, server.port, server.username);
 	worker->moveToThread(&thread);
+	file_worker =
+	    new sftp_worker(server.host, server.port, server.username);
+	file_worker->moveToThread(&sftp_thread);
 
 	connect(&thread, &QThread::started, worker,
 		&ssh_worker::connect_to_server);
@@ -19,6 +23,14 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 
 	connect(this, &ssh_connection::disconnect_requested, worker,
 		&ssh_worker::disconnect, Qt::QueuedConnection);
+
+	connect(this, &ssh_connection::sftp_authentication_requested,
+		file_worker, &sftp_worker::connect_and_authenticate,
+		Qt::QueuedConnection);
+
+	connect(this, &ssh_connection::sftp_disconnect_requested,
+		file_worker, &sftp_worker::disconnect,
+		Qt::QueuedConnection);
 
 	connect(worker, &ssh_worker::host_key_unknown, this,
 		&ssh_connection::host_key_unknown);
@@ -36,12 +48,18 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 
 	connect(worker, &ssh_worker::disconnected, &thread, &QThread::quit,
 		Qt::DirectConnection);
+	connect(file_worker, &sftp_worker::disconnected, &sftp_thread,
+		&QThread::quit, Qt::DirectConnection);
 
 	connect(&thread, &QThread::finished, worker, &QObject::deleteLater);
+	connect(&sftp_thread, &QThread::finished, file_worker,
+		&QObject::deleteLater);
 
-	connect(&thread, &QThread::finished, this, [this]() {
-		finished_state = true;
-		emit finished();
+	connect(&thread, &QThread::finished, this,
+		&ssh_connection::handle_shell_thread_finished);
+	connect(&sftp_thread, &QThread::finished, this, [this]() {
+		sftp_thread_finished = true;
+		update_finished_state();
 	});
 
 	connect(this, &ssh_connection::shell_write_requested, worker,
@@ -56,25 +74,25 @@ ssh_connection::ssh_connection(const server_profile &server, QObject *parent)
 	connect(worker, &ssh_worker::shell_output, this,
 		&ssh_connection::shell_output);
 
-	connect(this, &ssh_connection::sftp_list_requested, worker,
-		&ssh_worker::list_sftp_directory, Qt::QueuedConnection);
+	connect(this, &ssh_connection::sftp_list_requested, file_worker,
+		&sftp_worker::list_directory, Qt::QueuedConnection);
 
-	connect(this, &ssh_connection::sftp_download_requested, worker,
-		&ssh_worker::download_sftp_file, Qt::QueuedConnection);
+	connect(this, &ssh_connection::sftp_download_requested, file_worker,
+		&sftp_worker::download_file, Qt::QueuedConnection);
 
-	connect(this, &ssh_connection::sftp_upload_requested, worker,
-		&ssh_worker::upload_sftp_file, Qt::QueuedConnection);
+	connect(this, &ssh_connection::sftp_upload_requested, file_worker,
+		&sftp_worker::upload_file, Qt::QueuedConnection);
 
-	connect(worker, &ssh_worker::sftp_ready, this,
+	connect(file_worker, &sftp_worker::ready, this,
 		&ssh_connection::sftp_ready);
 
-	connect(worker, &ssh_worker::sftp_directory_list, this,
+	connect(file_worker, &sftp_worker::directory_list, this,
 		&ssh_connection::sftp_directory_list);
 
-	connect(worker, &ssh_worker::sftp_transfer_progress, this,
+	connect(file_worker, &sftp_worker::transfer_progress, this,
 		&ssh_connection::sftp_transfer_progress);
 
-	connect(worker, &ssh_worker::sftp_transfer_finished, this,
+	connect(file_worker, &sftp_worker::transfer_finished, this,
 		&ssh_connection::sftp_transfer_finished);
 }
 
@@ -85,12 +103,25 @@ ssh_connection::~ssh_connection()
 
 void ssh_connection::shutdown()
 {
-	if (!started)
+	if (!started) {
+		closing = true;
+		if (file_worker)
+			file_worker->request_stop();
+		delete worker;
+		worker = nullptr;
+		delete file_worker;
+		file_worker = nullptr;
+		shell_thread_finished = true;
+		sftp_thread_finished = true;
+		update_finished_state();
 		return;
+	}
 
 	close();
 	if (thread.isRunning())
 		thread.wait();
+	if (sftp_thread.isRunning())
+		sftp_thread.wait();
 }
 
 void ssh_connection::start()
@@ -100,6 +131,7 @@ void ssh_connection::start()
 
 	started = true;
 	thread.start();
+	sftp_thread.start();
 }
 
 void ssh_connection::close()
@@ -109,10 +141,18 @@ void ssh_connection::close()
 
 	closing = true;
 
-	if (!started)
+	if (!started) {
+		if (file_worker)
+			file_worker->request_stop();
+		shell_thread_finished = true;
+		sftp_thread_finished = true;
+		update_finished_state();
 		return;
+	}
 
+	file_worker->request_stop();
 	emit disconnect_requested();
+	emit sftp_disconnect_requested();
 }
 
 void ssh_connection::trust_host_key()
@@ -123,8 +163,10 @@ void ssh_connection::trust_host_key()
 
 void ssh_connection::authenticate(const QString &password)
 {
-	if (!closing)
+	if (!closing) {
 		emit authentication_requested(password);
+		emit sftp_authentication_requested(password);
+	}
 }
 
 void ssh_connection::write_shell(const QByteArray &data)
@@ -166,4 +208,25 @@ void ssh_connection::upload_sftp_file(quint64 request_id,
 bool ssh_connection::is_finished() const
 {
 	return finished_state;
+}
+
+void ssh_connection::handle_shell_thread_finished()
+{
+	shell_thread_finished = true;
+	if (!closing) {
+		closing = true;
+		file_worker->request_stop();
+		emit sftp_disconnect_requested();
+	}
+	update_finished_state();
+}
+
+void ssh_connection::update_finished_state()
+{
+	if (finished_state || !shell_thread_finished ||
+	    !sftp_thread_finished)
+		return;
+
+	finished_state = true;
+	emit finished();
 }

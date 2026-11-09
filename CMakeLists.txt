@@ -56,6 +56,8 @@ qt_add_executable(himashinya
     src/ssh_client.h
     src/ssh_worker.cpp
     src/ssh_worker.h
+    src/sftp_worker.cpp
+    src/sftp_worker.h
     src/ssh_connection.cpp
     src/ssh_connection.h
     src/terminal_widget.cpp

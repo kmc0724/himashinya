@@ -9,6 +9,7 @@
 #include <QVariantList>
 
 class ssh_worker;
+class sftp_worker;
 
 class ssh_connection : public QObject
 {
@@ -47,6 +48,8 @@ signals:
 	void trust_requested();
 	void authentication_requested(const QString &password);
 	void disconnect_requested();
+	void sftp_authentication_requested(const QString &password);
+	void sftp_disconnect_requested();
 
 	void shell_ready();
 	void shell_output(const QByteArray &data);
@@ -71,9 +74,16 @@ signals:
 
 private:
 	QThread thread;
+	QThread sftp_thread;
 	ssh_worker *worker = nullptr;
+	sftp_worker *file_worker = nullptr;
 
 	bool started = false;
 	bool closing = false;
 	bool finished_state = false;
+	bool shell_thread_finished = false;
+	bool sftp_thread_finished = false;
+
+	void handle_shell_thread_finished();
+	void update_finished_state();
 };

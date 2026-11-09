@@ -40,10 +40,12 @@ public:
 				 QVariantList &entries);
 	bool download_sftp_file(const QString &remote_path,
 				const QString &local_path,
-				const std::function<void(quint64, quint64)> &progress);
+				const std::function<void(quint64, quint64)> &progress,
+				const std::function<bool()> &cancelled);
 	bool upload_sftp_file(const QString &local_path,
 			      const QString &remote_path,
-			      const std::function<void(quint64, quint64)> &progress);
+			      const std::function<void(quint64, quint64)> &progress,
+			      const std::function<bool()> &cancelled);
 
 	bool is_shell_open() const;
 	bool is_connected() const;
